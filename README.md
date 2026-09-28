@@ -33,6 +33,7 @@ python -m arena.benchmark --controller simple_avoid --episodes 30 --sweep latenc
 python -m arena.benchmark --controller simple_avoid --episodes 20 --adaptive world_speed_scale
 
 python -m arena.replay runs/<run_dir>      # re-simulate a logged episode and verify it matches
+python -m arena.viewer runs/<bench_dir> --at collision   # step through saved episodes (needs --save-events)
 
 # Jev via OpenRouter: cp .env.example .env, fill OPENROUTER_API_KEY, then
 python -m arena.jev_check
@@ -83,6 +84,31 @@ benchmark/
   remote_validation.py    remote (real latency) vs simulated latency, paired per seed
 tests/                    physics, collision, observation, determinism, isolation, async, headless
 ```
+
+## Watching decisions (GUI)
+
+`main.py` has a live **inspector panel**, and `arena.viewer` replays saved
+episodes with the same panel:
+
+* **In flight**: the pending request and how long it has been waiting, with
+  the decision period marked.
+* **Last response**: the action, latency, how many ticks after its snapshot
+  it took effect, confidence, and a probability bar per action (Jev).
+* **Stats**: applied / failed / missed counts, mean and p95 latency, the
+  effective decision rate, and a latency sparkline.
+* **History**: the most recent decisions.
+* **J** cycles to the **raw request body** (exactly what went over the wire)
+  and the **raw response**.
+* **In the arena**: a faded **ghost** of the snapshot the controller is
+  currently deciding on (the gap to reality is the latency cost), the thrust
+  arrow, and a **probability compass** around the player.
+
+Viewer keys: Space play/pause, ←/→ step a tick (Shift = 10), `,`/`.` jump
+between decisions, `[`/`]` speed from 0.05× to 4×, C jumps to 2 s before the
+collision, PageUp/PageDown switches episode, and you can click or drag the
+timeline. In `main.py`, press V after an episode ends to replay it. The world
+is re-simulated exactly from the log and no controller or API is called, so
+replays are free.
 
 ## Design
 

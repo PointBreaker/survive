@@ -52,6 +52,9 @@ class RemoteController(ThreadedController):
         self._conn: Optional[http.client.HTTPConnection] = None
         self.session: Optional[str] = None
         self._request_id = 0
+        # Last wire traffic, for GUI inspection only (never read by the runner).
+        self.last_request_body: Optional[dict[str, Any]] = None
+        self.last_response: Any = None
 
     # ---------------------------------------------------------- transport
     def _connection(self) -> http.client.HTTPConnection:
@@ -110,10 +113,14 @@ class RemoteController(ThreadedController):
     def decide(self, observation: Observation) -> Decision:
         rid = self._request_id
         self._request_id += 1
+        body = self.encode_decide(rid, observation)
+        self.last_request_body = body
         try:
-            payload = self._post(self.decide_path, self.encode_decide(rid, observation))
+            payload = self._post(self.decide_path, body)
+            self.last_response = payload
             action, meta = self.decode_decide(payload, rid)
         except (OSError, http.client.HTTPException, ValueError) as e:
+            self.last_response = {"error": f"{type(e).__name__}: {e}"}
             return Decision.failed(f"{type(e).__name__}: {e}")
         return Decision(action, meta=meta)
 
