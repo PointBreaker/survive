@@ -33,6 +33,11 @@ python -m arena.benchmark --controller simple_avoid --episodes 30 --sweep latenc
 python -m arena.benchmark --controller simple_avoid --episodes 20 --adaptive world_speed_scale
 
 python -m arena.replay runs/<run_dir>      # re-simulate a logged episode and verify it matches
+
+# out-of-process (Jev) path, validated against a local fake service
+python -m remote.fake_server --port 8765 --policy simple_avoid --latency-ms 150 &
+python -m arena.benchmark --controller jev --endpoint http://127.0.0.1:8765 --episodes 10
+python -m benchmark.remote_validation --latencies 50,65,100,150,200 --episodes 10
 python -m pytest
 ```
 
@@ -60,10 +65,16 @@ arena/
 controllers/
   base.py                 Controller protocol, SyncController, ThreadedController, LatencyWrapper
   human.py random.py greedy.py simple_avoid.py sleep.py
+  remote.py               generic HTTP client for remote.protocol (worker thread, keep-alive)
+  jev.py                  JevController: RemoteController + JEV_ENDPOINT / JEV_API_KEY config
+remote/
+  protocol.py             wire protocol decision-arena/v0 (JSON over HTTP)
+  fake_server.py          local stand-in service: baseline policy + real latency/jitter/failures
 benchmark/
   runner.py               batch episodes (seed i = base_seed + i)
   metrics.py              aggregation, Wilson CI, threshold (D90/D50/D10) helper
   adaptive.py             staircase search for the failure frontier
+  remote_validation.py    remote (real latency) vs simulated latency, paired per seed
 tests/                    physics, collision, observation, determinism, isolation, async, headless
 ```
 
@@ -122,6 +133,28 @@ collision_time, collision_obstacle_id, decision/request/missed/late counts,
 mean/p50/p95 latency, world_speed_scale, decision_hz, obstacle_count, and
 per-tick `action_changes` for exact replay. There's no composite score.
 
+### Out-of-process controllers (Jev)
+`JevController` sends the unified `ArenaInfo`/`Observation` as their unmodified
+`to_dict()` JSON (protocol `decision-arena/v0`, see `remote/protocol.py`):
+
+```
+POST /reset   {"protocol", "info"}                                  -> {"session"}
+POST /decide  {"protocol", "session", "request_id", "observation"}  -> {"request_id", "action", "meta"?}
+```
+
+* The HTTP call runs on a worker thread, and the runner times the whole round
+  trip. Transport overhead is part of the controller's latency.
+* Any failure (HTTP error, timeout, bad JSON, unknown action, request_id
+  mismatch, service down) is a **failed decision**. It's logged, and the
+  previous action continues. The client never retries within a request and
+  never picks an action itself.
+* `meta` (e.g. the server's own `server_ms`) is logged for diagnosis and
+  never used for timing.
+* Config: `--endpoint` or `JEV_ENDPOINT`, `JEV_API_KEY` (bearer header,
+  never logged), `JEV_TIMEOUT_S`. If the real Jev API has a different format,
+  override `encode_reset` / `encode_decide` / `decode_decide`. They may change
+  the encoding, not the information content.
+
 ## Baseline results (medium preset, 12 obstacles, 10 Hz, 1×)
 
 | controller | success (50 ep) | avg targets | avg survival |
@@ -159,5 +192,7 @@ world speed D50 ≈ 3.0× · added latency D50 ≈ 108 ms · obstacle count D50 
   mode.
 * No oracle yet, so some high-difficulty episodes may be unwinnable.
   Generation only rules out obviously unfair starts.
+* The fake server holds one session per `/reset`. It's a test double, not a
+  production server.
 * Obstacles are straight-line and bounce-only, with no obstacle-obstacle
   collisions. The action space is discrete.

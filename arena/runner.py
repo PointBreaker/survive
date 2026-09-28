@@ -64,7 +64,9 @@ class DecisionStats:
     applied: int = 0
     missed_slots: int = 0
     late_dropped: int = 0
+    failed: int = 0
     latencies_s: list[float] = field(default_factory=list)
+    delay_ticks: list[int] = field(default_factory=list)  # applied: effective - request tick
 
 
 class EpisodeRunner:
@@ -221,7 +223,7 @@ class EpisodeRunner:
                     "id": pr.id,
                     "tick": j,
                     "reason": "deadline",
-                    "action": pr.decision.action.value,
+                    "action": None if pr.decision.action is None else pr.decision.action.value,
                     "latency_ms": pr.latency_s * 1000,
                 }
             )
@@ -230,8 +232,25 @@ class EpisodeRunner:
         if j < pr.effective_tick:
             return
 
+        if pr.decision.action is None:
+            # Failed request: nothing to apply, previous action continues.
+            self.stats.failed += 1
+            self.recorder.event(
+                {
+                    "type": "decision_failed",
+                    "id": pr.id,
+                    "tick": j,
+                    "error": pr.decision.error,
+                    "latency_ms": pr.latency_s * 1000,
+                    "meta": pr.decision.meta,
+                }
+            )
+            self._pending = None
+            return
+
         action = pr.decision.action
         self.stats.applied += 1
+        self.stats.delay_ticks.append(j - pr.tick)
         self.last_latency_s = pr.latency_s
         if action != self.current_action:
             self.action_changes.append((j, action.value))
@@ -244,6 +263,7 @@ class EpisodeRunner:
                 "applied_tick": j,
                 "action": action.value,
                 "latency_ms": pr.latency_s * 1000,
+                **({"meta": pr.decision.meta} if pr.decision.meta else {}),
             }
         )
         self._pending = None
@@ -277,9 +297,11 @@ class EpisodeRunner:
             "request_count": st.requests,
             "missed_slots": st.missed_slots,
             "late_dropped": st.late_dropped,
+            "failed_decisions": st.failed,
             "mean_decision_latency_ms": mean(lat_ms),
             "p50_latency_ms": percentile(lat_ms, 50),
             "p95_latency_ms": percentile(lat_ms, 95),
+            "mean_delay_ticks": mean(st.delay_ticks),
             "world_speed_scale": cfg.world_speed_scale,
             "decision_hz": cfg.decision_hz,
             "obstacle_count": cfg.obstacle_count,

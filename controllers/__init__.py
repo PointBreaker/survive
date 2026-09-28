@@ -10,7 +10,9 @@ from controllers.base import Controller
 def _registry() -> dict[str, Callable[..., Controller]]:
     from controllers.greedy import GreedyController
     from controllers.human import HumanController
+    from controllers.jev import JevController
     from controllers.random import RandomController
+    from controllers.remote import RemoteController
     from controllers.simple_avoid import SimpleAvoidController
     from controllers.sleep import SleepController
 
@@ -20,10 +22,12 @@ def _registry() -> dict[str, Callable[..., Controller]]:
         "greedy": GreedyController,
         "simple_avoid": SimpleAvoidController,
         "sleep": SleepController,
+        "jev": JevController,
+        "remote": RemoteController,
     }
 
 
-CONTROLLER_NAMES = ("human", "random", "greedy", "simple_avoid", "sleep")
+CONTROLLER_NAMES = ("human", "random", "greedy", "simple_avoid", "sleep", "jev", "remote")
 
 
 def make_controller(name: str, **kwargs) -> Controller:

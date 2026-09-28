@@ -33,6 +33,8 @@ def add_difficulty_args(ap: argparse.ArgumentParser) -> None:
     )
     c.add_argument("--controller-seed", type=int, default=12345, help="RNG seed of the random controller")
     c.add_argument("--sleep-ms", type=float, default=500.0, help="delay of the diagnostic sleep controller")
+    c.add_argument("--endpoint", default=None,
+                   help="decision service URL for jev/remote (jev default: $JEV_ENDPOINT or http://127.0.0.1:8765)")
 
 
 DIFFICULTY_FIELDS = (
@@ -70,6 +72,8 @@ def controller_factory(name: str, args: argparse.Namespace, latency_ms: Optional
         kwargs["seed"] = args.controller_seed
     elif name == "sleep":
         kwargs["delay_ms"] = args.sleep_ms
+    elif name in ("jev", "remote") and args.endpoint:
+        kwargs["endpoint"] = args.endpoint
     delay = args.latency_ms if latency_ms is None else latency_ms
 
     def factory():

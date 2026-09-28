@@ -34,11 +34,21 @@ from arena.observation import ArenaInfo, Observation
 
 @dataclass(frozen=True)
 class Decision:
-    action: Action
+    # None means the request failed (network error, invalid reply, ...). The
+    # runner then keeps the previous action; nobody substitutes a "safe" one.
+    action: Optional[Action]
     # Simulated latency added on top of the measured one. It can only make a
     # controller slower. The measured part is timed by the runner's own clock
     # (request handed over -> decision received); controllers cannot report it.
     extra_latency_s: float = 0.0
+    error: Optional[str] = None
+    # Free-form diagnostics for the log (e.g. server-reported compute time).
+    # Never used for timing or scoring.
+    meta: Optional[dict] = None
+
+    @classmethod
+    def failed(cls, error: str, meta: Optional[dict] = None) -> "Decision":
+        return cls(None, error=error, meta=meta)
 
 
 class Controller(ABC):
@@ -86,7 +96,8 @@ class ThreadedController(Controller):
         self._worker: Optional[threading.Thread] = None
 
     @abstractmethod
-    def decide(self, observation: Observation) -> Action:
+    def decide(self, observation: Observation) -> "Action | Decision":
+        """Return an Action, or a full Decision (e.g. ``Decision.failed``)."""
         ...
 
     def _run(self) -> None:
@@ -94,7 +105,12 @@ class ThreadedController(Controller):
             obs = self._inbox.get()
             if obs is None:
                 return
-            self._outbox.put(Decision(Action(self.decide(obs))))
+            try:
+                result = self.decide(obs)
+                d = result if isinstance(result, Decision) else Decision(Action(result))
+            except Exception as e:  # a crashing decide() is a failed request, not a dead worker
+                d = Decision.failed(f"{type(e).__name__}: {e}")
+            self._outbox.put(d)
 
     def reset(self, info: ArenaInfo) -> None:
         super().reset(info)
@@ -153,7 +169,7 @@ class LatencyWrapper(Controller):
         d = self._held
         if self.simulated:
             self._held = None
-            return Decision(d.action, d.extra_latency_s + self.delay_s)
+            return Decision(d.action, d.extra_latency_s + self.delay_s, d.error, d.meta)
         if time.perf_counter() < self._release_at:
             return None
         self._held = None

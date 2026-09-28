@@ -42,6 +42,10 @@ class ArenaInfo:
         d["actions"] = list(self.actions)
         return d
 
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ArenaInfo":
+        return cls(**{**d, "actions": tuple(d["actions"])})
+
 
 @dataclass(frozen=True)
 class Observation:
@@ -63,6 +67,18 @@ class Observation:
             "arena": dict(self.arena),
             "score": self.score,
         }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "Observation":
+        return cls(
+            timestamp=d["timestamp"],
+            tick=d["tick"],
+            player=dict(d["player"]),
+            target=dict(d["target"]),
+            obstacles=tuple(dict(o) for o in d["obstacles"]),
+            arena=dict(d["arena"]),
+            score=d["score"],
+        )
 
 
 # Keys that must never appear anywhere in an observation. Checked by tests.

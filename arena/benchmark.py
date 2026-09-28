@@ -26,7 +26,7 @@ from benchmark.adaptive import find_frontier
 from benchmark.metrics import aggregate, threshold_level
 from benchmark.runner import run_episodes
 
-HEADLESS_CONTROLLERS = ("random", "greedy", "simple_avoid", "sleep")
+HEADLESS_CONTROLLERS = ("random", "greedy", "simple_avoid", "sleep", "jev", "remote")
 SWEEPABLE = (
     "world_speed_scale",
     "obstacle_count",

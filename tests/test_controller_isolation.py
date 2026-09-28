@@ -12,6 +12,7 @@ from controllers.base import SyncController
 
 CONTROLLERS_DIR = Path(__file__).resolve().parents[1] / "controllers"
 ALLOWED_ARENA_MODULES = {"arena.action", "arena.observation"}
+REMOTE_DIR = Path(__file__).resolve().parents[1] / "remote"
 FORBIDDEN_MODULES = {"arena.environment", "arena.physics", "arena.entities", "arena.runner",
                      "arena.replay", "arena.recorder", "benchmark", "gc", "inspect", "ctypes"}
 
@@ -31,8 +32,17 @@ def test_controllers_only_import_public_interface():
         for mod in imported_modules(path):
             if mod.startswith("arena"):
                 assert mod in ALLOWED_ARENA_MODULES, f"{path.name} imports {mod}"
+            if mod.startswith("remote"):
+                assert mod == "remote.protocol", f"{path.name} imports {mod}"
             assert not any(mod == f or mod.startswith(f + ".") for f in FORBIDDEN_MODULES), \
                 f"{path.name} imports {mod}"
+
+
+def test_wire_protocol_only_uses_public_interface():
+    for path in REMOTE_DIR.glob("*.py"):
+        for mod in imported_modules(path):
+            if mod.startswith("arena"):
+                assert mod in ALLOWED_ARENA_MODULES, f"remote/{path.name} imports {mod}"
 
 
 def test_controller_source_has_no_backdoor_names():

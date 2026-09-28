@@ -15,7 +15,7 @@ import sys
 from arena.cli import add_difficulty_args, config_from_args, controller_factory
 from arena.recorder import JsonlRecorder, NullRecorder, new_run_dir
 
-INTERACTIVE_CONTROLLERS = ("human", "random", "greedy", "simple_avoid", "sleep")
+INTERACTIVE_CONTROLLERS = ("human", "random", "greedy", "simple_avoid", "sleep", "jev", "remote")
 
 
 def main(argv: list[str] | None = None) -> int:
