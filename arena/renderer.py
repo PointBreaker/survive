@@ -40,6 +40,7 @@ OK = (120, 230, 120)
 BAD = (240, 95, 85)
 WARN = (245, 170, 70)
 ACCENT = (110, 170, 255)
+STATUS_COLOR = {"applied": TEXT, "failed": BAD, "dropped": WARN, "superseded": DIM}
 
 COMPASS_ORDER = ("N", "NE", "E", "SE", "S", "SW", "W", "NW", "STAY")
 PANEL_MODES = ("decisions", "request", "response")
@@ -329,25 +330,29 @@ class Renderer:
     def _section_inflight(self, env, ins: Inspector, x, y) -> int:
         scr = self.screen
         y = self._rule(x, y)
-        req = ins.inflight()
+        reqs = ins.inflight_all()
         period_ms = 1000.0 / env.config.decision_hz
-        if req:
-            waited = (env.tick - req["tick"]) * TICK_MS
-            self._text(scr, f"IN FLIGHT  #{req['id']}", (x, y), WARN, self.f_bold)
-            self._text(scr, f"{waited:6.0f} ms", (x + 300, y), WARN, self.f_bold)
-            y += 22
-            scale_ms = max(500.0, waited * 1.1)
-            bw = self.PANEL_W - 28
-            pygame.draw.rect(scr, (30, 32, 40), (x, y, bw, 10))
-            pygame.draw.rect(scr, WARN, (x, y, int(bw * min(1, waited / scale_ms)), 10))
-            px = x + int(bw * period_ms / scale_ms)
-            pygame.draw.line(scr, TEXT, (px, y - 3), (px, y + 13), 1)
-            y += 14
-            self._text(scr, f"snapshot t={req['observation']['timestamp']:.2f}s  (| = decision period "
-                            f"{period_ms:.0f}ms)", (x, y), DIM, self.f_small)
+        cap = env.config.max_inflight
+        if reqs:
+            self._text(scr, f"IN FLIGHT  {len(reqs)}/{cap}", (x, y), WARN, self.f_bold)
+            y += 20
+            waits = [(r, (env.tick - r["tick"]) * TICK_MS) for r in reqs]
+            scale_ms = max(500.0, max(w for _, w in waits) * 1.1)
+            bw = self.PANEL_W - 28 - 120
+            for r, waited in waits[:5]:
+                self._text(scr, f"#{r['id']:<4}", (x, y - 2), TEXT, self.f_small)
+                bx = x + 50
+                pygame.draw.rect(scr, (30, 32, 40), (bx, y, bw, 9))
+                pygame.draw.rect(scr, WARN, (bx, y, int(bw * min(1, waited / scale_ms)), 9))
+                px = bx + int(bw * period_ms / scale_ms)
+                pygame.draw.line(scr, TEXT, (px, y - 2), (px, y + 11), 1)
+                self._text(scr, f"{waited:5.0f} ms", (bx + bw + 8, y - 2), WARN, self.f_small)
+                y += 14
+            self._text(scr, f"ghost = oldest (#{reqs[0]['id']})   | = period {period_ms:.0f}ms",
+                       (x, y), DIM, self.f_small)
             y += 16
         else:
-            self._text(scr, "idle  (no request in flight)", (x, y), DIM, self.f_bold)
+            self._text(scr, f"idle  (0/{cap} requests in flight)", (x, y), DIM, self.f_bold)
             y += 22
         return y + 4
 
@@ -358,7 +363,7 @@ class Renderer:
         if last is None:
             self._text(scr, "no decision yet", (x, y), DIM)
             return y + 24
-        color = {"applied": TEXT, "failed": BAD, "dropped": WARN}[last.status]
+        color = STATUS_COLOR[last.status]
         self._text(scr, f"LAST RESPONSE  #{last.id}  {last.status}", (x, y), DIM, self.f_bold)
         y += 20
         label = last.action or "—"
@@ -402,11 +407,13 @@ class Renderer:
         mean_ms = "-" if st["mean_ms"] is None else f"{st['mean_ms']:.0f}"
         p95 = "-" if st["p95_ms"] is None else f"{st['p95_ms']:.0f}"
         self._text(scr, f"applied {st['applied']}  failed {st['failed']}  dropped {st['dropped']}  "
-                        f"missed slots {st['missed']}", (x, y), TEXT, self.f_small)
+                        f"superseded {st['superseded']}", (x, y), TEXT, self.f_small)
         y += 16
-        self._text(scr, f"latency mean {mean_ms}ms p95 {p95}ms", (x, y), TEXT, self.f_small)
-        self._text(scr, f"rate {st['applied'] / secs:.1f}/s (max {env.config.decision_hz:g})",
-                   (x + 250, y), TEXT, self.f_small)
+        self._text(scr, f"missed slots {st['missed']}  latency mean {mean_ms}ms p95 {p95}ms", (x, y), TEXT,
+                   self.f_small)
+        y += 16
+        self._text(scr, f"rate {st['applied'] / secs:.1f} decisions/s  (max {env.config.decision_hz:g}Hz, "
+                        f"{env.config.max_inflight} in flight)", (x, y), TEXT, self.f_small)
         y += 18
         recent = st["recent_ms"]
         h = 40
@@ -436,7 +443,7 @@ class Renderer:
                 break
             conf = (r.meta or {}).get("confidence")
             cs = f"{conf:.2f}" if isinstance(conf, (int, float)) else "  - "
-            color = {"applied": TEXT, "failed": BAD, "dropped": WARN}[r.status]
+            color = STATUS_COLOR[r.status]
             act = r.action or r.status.upper()
             self._text(scr, f"{r.id:4d} {r.request_tick / 60:6.2f}  {act:<6} {cs}  {r.latency_ms:5.0f}ms  "
                             f"+{r.delay_ticks}t", (x, y), color, self.f_small)

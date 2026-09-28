@@ -17,12 +17,20 @@ from arena.stats import mean, percentile
 TICK_MS = 1000.0 / 60.0
 
 
+STATUS_OF = {
+    "decision": "applied",
+    "decision_failed": "failed",
+    "decision_dropped": "dropped",
+    "decision_superseded": "superseded",
+}
+
+
 @dataclass
 class DecisionRecord:
     id: int
     request_tick: int
     resolve_tick: int
-    status: str  # applied | failed | dropped
+    status: str  # applied | failed | dropped | superseded
     action: Optional[str]
     latency_ms: float
     meta: Optional[dict] = None
@@ -50,7 +58,7 @@ class Inspector:
     history: int = 400
     requests: dict[int, dict[str, Any]] = field(default_factory=dict)  # id -> request event
     records: list[DecisionRecord] = field(default_factory=list)
-    inflight_id: Optional[int] = None
+    open_ids: list[int] = field(default_factory=list)  # requests without an outcome yet, oldest first
     missed_slots: int = 0
     targets: list[int] = field(default_factory=list)  # ticks
     collision: Optional[dict[str, Any]] = None
@@ -63,13 +71,13 @@ class Inspector:
             self.start = ev
         elif t == "request":
             self.requests[ev["id"]] = ev
-            self.inflight_id = ev["id"]
+            self.open_ids.append(ev["id"])
             if len(self.requests) > self.history:
                 for k in sorted(self.requests)[: len(self.requests) - self.history]:
                     del self.requests[k]
-        elif t in ("decision", "decision_failed", "decision_dropped"):
+        elif t in STATUS_OF:
             req = self.requests.get(ev["id"], {})
-            status = {"decision": "applied", "decision_failed": "failed", "decision_dropped": "dropped"}[t]
+            status = STATUS_OF[t]
             self.records.append(
                 DecisionRecord(
                     id=ev["id"],
@@ -82,8 +90,8 @@ class Inspector:
                     error=ev.get("error"),
                 )
             )
-            if self.inflight_id == ev["id"]:
-                self.inflight_id = None
+            if ev["id"] in self.open_ids:
+                self.open_ids.remove(ev["id"])
         elif t == "missed_slot":
             self.missed_slots += 1
         elif t == "target_collected":
@@ -95,7 +103,11 @@ class Inspector:
 
     # ------------------------------------------------------------- queries
     def inflight(self) -> Optional[dict[str, Any]]:
-        return self.requests.get(self.inflight_id) if self.inflight_id is not None else None
+        """Oldest outstanding request (the next answer expected to land)."""
+        return self.requests.get(self.open_ids[0]) if self.open_ids else None
+
+    def inflight_all(self) -> list[dict[str, Any]]:
+        return [self.requests[i] for i in self.open_ids if i in self.requests]
 
     def last_applied(self) -> Optional[DecisionRecord]:
         for r in reversed(self.records):
@@ -116,6 +128,7 @@ class Inspector:
             "applied": sum(r.status == "applied" for r in self.records),
             "failed": sum(r.status == "failed" for r in self.records),
             "dropped": sum(r.status == "dropped" for r in self.records),
+            "superseded": sum(r.status == "superseded" for r in self.records),
             "missed": self.missed_slots,
             "mean_ms": mean(lat),
             "p95_ms": percentile(lat, 95),
@@ -147,7 +160,7 @@ def timeline_data(ins: Inspector, total_ticks: int, current: int, label: str = "
         "current": current,
         "requests": [r["tick"] for r in ins.requests.values()],
         "applied": [r.resolve_tick for r in ins.records if r.status == "applied"],
-        "failed": [r.resolve_tick for r in ins.records if r.status != "applied"],
+        "failed": [r.resolve_tick for r in ins.records if r.status in ("failed", "dropped")],
         "targets": list(ins.targets),
         "collision_tick": ins.collision["tick"] if ins.collision else None,
         "label": label,

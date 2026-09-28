@@ -72,7 +72,7 @@ class Playback:
         self.decision_ticks = sorted(
             {e["tick"] for e in self.events if e["type"] == "request"}
             | {int(t) for e, t in zip(self.events, self.event_ticks)
-               if e["type"] in ("decision", "decision_failed", "decision_dropped")}
+               if e["type"] in ("decision", "decision_failed", "decision_dropped", "decision_superseded")}
         )
         col = next((e for e in self.events if e["type"] == "collision"), None)
         self.collision_tick = col["tick"] if col else None

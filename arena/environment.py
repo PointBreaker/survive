@@ -83,6 +83,7 @@ class Environment:
             world_speed_scale=cfg.world_speed_scale,
             decision_hz=cfg.decision_hz,
             decision_deadline_ms=cfg.decision_deadline_ms,
+            max_inflight=cfg.max_inflight,
             player_radius=cfg.player_radius,
             player_max_speed=cfg.player_max_speed,
             player_acceleration=cfg.player_acceleration,

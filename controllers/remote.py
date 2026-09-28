@@ -11,8 +11,10 @@ client never retries within a request and never picks an action itself.
 from __future__ import annotations
 
 import http.client
+import itertools
 import json
 import socket
+import threading
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
@@ -49,30 +51,41 @@ class RemoteController(ThreadedController):
         self._base_path = u.path.rstrip("/")
         self.timeout_s = timeout_s
         self._headers = {"Content-Type": "application/json", **(headers or {})}
-        self._conn: Optional[http.client.HTTPConnection] = None
+        # One keep-alive connection per worker thread (max_inflight > 1 means
+        # concurrent calls; http.client connections are not thread-safe).
+        self._local = threading.local()
+        self._all_conns: list[http.client.HTTPConnection] = []
+        self._conns_lock = threading.Lock()
         self.session: Optional[str] = None
-        self._request_id = 0
+        self._wire_ids = itertools.count()
         # Last wire traffic, for GUI inspection only (never read by the runner).
         self.last_request_body: Optional[dict[str, Any]] = None
         self.last_response: Any = None
 
     # ---------------------------------------------------------- transport
     def _connection(self) -> http.client.HTTPConnection:
-        if self._conn is None:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
             cls = http.client.HTTPSConnection if self._scheme == "https" else http.client.HTTPConnection
             conn = cls(self._host, self._port, timeout=self.timeout_s)
             conn.connect()
             # Small JSON messages: disable Nagle so we do not pay delayed-ACK stalls.
             conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            self._conn = conn
-        return self._conn
+            self._local.conn = conn
+            with self._conns_lock:
+                self._all_conns.append(conn)
+        return conn
 
     def _drop_connection(self) -> None:
-        if self._conn is not None:
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            self._local.conn = None
             try:
-                self._conn.close()
+                conn.close()
             finally:
-                self._conn = None
+                with self._conns_lock:
+                    if conn in self._all_conns:
+                        self._all_conns.remove(conn)
 
     def _post(self, path: str, body: dict[str, Any]) -> Any:
         data = json.dumps(body, separators=(",", ":")).encode()
@@ -104,15 +117,13 @@ class RemoteController(ThreadedController):
     def reset(self, info: ArenaInfo) -> None:
         # Runs before the episode clock starts; failure here aborts the run.
         super().reset(info)
-        self._request_id = 0
         if self.reset_path is None:
             return
         reply = self._post(self.reset_path, self.encode_reset(info))
         self.session = reply.get("session") if isinstance(reply, dict) else None
 
     def decide(self, observation: Observation) -> Decision:
-        rid = self._request_id
-        self._request_id += 1
+        rid = next(self._wire_ids)  # wire-level id; thread-safe
         body = self.encode_decide(rid, observation)
         self.last_request_body = body
         try:
@@ -126,4 +137,10 @@ class RemoteController(ThreadedController):
 
     def close(self) -> None:
         super().close()
-        self._drop_connection()
+        with self._conns_lock:
+            conns, self._all_conns = self._all_conns, []
+        for c in conns:
+            try:
+                c.close()
+            except OSError:
+                pass

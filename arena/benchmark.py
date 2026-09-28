@@ -160,7 +160,8 @@ def main(argv: list[str] | None = None) -> int:
         agg = aggregate(results)
         summary["aggregate"] = agg
         print_summary(f"{args.controller}  obstacles={base_cfg.obstacle_count} "
-                      f"world_speed={base_cfg.world_speed_scale:g}x decision_hz={base_cfg.decision_hz:g}", agg)
+                      f"world_speed={base_cfg.world_speed_scale:g}x decision_hz={base_cfg.decision_hz:g} "
+                      f"inflight={base_cfg.max_inflight}", agg)
         if out_dir:
             out_dir.mkdir(parents=True, exist_ok=True)
             with open(out_dir / "episodes.jsonl", "w") as f:

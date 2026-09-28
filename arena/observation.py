@@ -39,6 +39,7 @@ class ArenaInfo:
     world_speed_scale: float
     decision_hz: float
     decision_deadline_ms: Optional[float]
+    max_inflight: int
     player_radius: float
     player_max_speed: float
     player_acceleration: float
@@ -56,7 +57,7 @@ class ArenaInfo:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ArenaInfo":
-        return cls(**{**d, "actions": tuple(d["actions"])})
+        return cls(**{"max_inflight": 1, **d, "actions": tuple(d["actions"])})
 
 
 @dataclass(frozen=True)

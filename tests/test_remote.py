@@ -50,7 +50,7 @@ def test_wire_payload_is_exactly_the_unified_observation(server_factory):
     runner.start()
     obs_sent = []
     real_request = ctrl.request
-    ctrl.request = lambda o: (obs_sent.append(o), real_request(o))
+    ctrl.request = lambda o, rid=None: (obs_sent.append(o), real_request(o, rid))
     for _ in range(30):
         runner.step_tick()
     time.sleep(0.05)

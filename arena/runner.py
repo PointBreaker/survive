@@ -4,13 +4,15 @@ Timing model
 ------------
 * Physics runs in ticks of 1/60 s of controller (wall-clock) time. Each tick
   advances the world by ``world_speed_scale / 60`` world seconds.
-* Decision slots occur every ``60 / decision_hz`` ticks. At a slot, if the
-  controller is idle, the current observation is captured and handed to
-  ``controller.request``. A controller has at most one request in flight.
-  If it is still busy when a slot comes, the slot is counted as missed and
-  served (with a fresh observation) on the tick the controller frees up.
-  So ``decision_hz`` is a maximum rate; a slow controller simply decides
-  as often as its own latency allows.
+* Decision slots occur every ``60 / decision_hz`` ticks. At a slot, if fewer
+  than ``max_inflight`` requests are outstanding, the current observation is
+  captured and handed to ``controller.request``. Otherwise the slot is
+  counted as missed and served (with a fresh observation) on the tick a
+  request frees up. So ``decision_hz`` is a maximum rate.
+* With several requests in flight, answers can arrive out of order. At each
+  tick the newest ready answer is applied; an answer to an older request
+  than the one already applied (or than another ready one) is *superseded*
+  and never applied. Stale information never overwrites fresher.
 * A decision with measured wall-clock latency L (from the moment its
   observation was handed over until the runner received the decision,
   timed by the runner's own clock, never self-reported) takes
@@ -65,6 +67,7 @@ class DecisionStats:
     missed_slots: int = 0
     late_dropped: int = 0
     failed: int = 0
+    superseded: int = 0
     latencies_s: list[float] = field(default_factory=list)
     delay_ticks: list[int] = field(default_factory=list)  # applied: effective - request tick
 
@@ -91,7 +94,9 @@ class EpisodeRunner:
         self._applied_request_tick: Optional[int] = None
         self.stats = DecisionStats()
         self.action_changes: list[tuple[int, str]] = [(0, Action.STAY.value)]
-        self._pending: Optional[_Pending] = None
+        self._pendings: dict[int, _Pending] = {}
+        self._last_applied_id = -1
+        self._max_inflight = cfg.max_inflight
         self._next_id = 0
         self._slot_period = physics.PHYSICS_HZ / cfg.decision_hz
         self._next_slot = 0.0
@@ -145,17 +150,17 @@ class EpisodeRunner:
             return
         k = env.tick
 
-        if self._pending is not None:
+        if self._pendings:
             self._resolve(k)
 
         if k + 1e-9 >= self._next_slot:
             while self._next_slot <= k + 1e-9:
                 self._next_slot += self._slot_period
-            if self._pending is not None:
+            if len(self._pendings) >= self._max_inflight:
                 self.stats.missed_slots += 1
-                self.recorder.event({"type": "missed_slot", "tick": k, "pending_id": self._pending.id})
+                self.recorder.event({"type": "missed_slot", "tick": k, "pending_ids": list(self._pendings)})
             self._slot_owed = True
-        if self._slot_owed and self._pending is None:
+        if self._slot_owed and len(self._pendings) < self._max_inflight:
             self._slot_owed = False
             self._issue_request(k)
 
@@ -194,74 +199,96 @@ class EpisodeRunner:
         self.stats.requests += 1
         self.recorder.event({"type": "request", "id": rid, "tick": k, "observation": obs.to_dict()})
         wall = time.perf_counter()
-        self._pending = _Pending(rid, k, wall)
-        self.controller.request(obs)
+        self._pendings[rid] = _Pending(rid, k, wall)
+        self.controller.request(obs, rid)
         # Inline (synchronous) controllers are done by now; time them exactly.
-        self._try_receive(self._pending)
+        self._receive_all()
 
-    def _try_receive(self, pr: _Pending) -> bool:
-        d = self.controller.poll()
-        if d is None:
-            return False
-        received = time.perf_counter()  # runner's clock is the only authority
-        pr.decision = d
-        pr.latency_s = (received - pr.wall) + max(0.0, d.extra_latency_s)
-        pr.effective_tick = pr.tick + max(1, math.ceil(pr.latency_s / TICK - 1e-9))
-        self.stats.latencies_s.append(pr.latency_s)
-        return True
+    def _receive_all(self) -> None:
+        while True:
+            d = self.controller.poll()
+            if d is None:
+                return
+            received = time.perf_counter()  # runner's clock is the only authority
+            rid = d.request_id
+            if rid is None:  # controller did not tag it: oldest unanswered request
+                rid = next((p.id for p in self._pendings.values() if p.decision is None), None)
+            pr = self._pendings.get(rid) if rid is not None else None
+            if pr is None or pr.decision is not None:
+                self.recorder.event({"type": "unmatched_decision", "request_id": d.request_id})
+                continue
+            pr.decision = d
+            pr.latency_s = (received - pr.wall) + max(0.0, d.extra_latency_s)
+            pr.effective_tick = pr.tick + max(1, math.ceil(pr.latency_s / TICK - 1e-9))
+            self.stats.latencies_s.append(pr.latency_s)
 
     def _resolve(self, j: int) -> None:
-        pr = self._pending
-        assert pr is not None
-        sim_elapsed = (j - pr.tick) * TICK
-        while pr.decision is None:
+        # 1. Establish the truth: which answers exist by the time of tick j.
+        while True:
             checked_at = time.perf_counter()
-            if self._try_receive(pr):
+            self._receive_all()
+            waits = [
+                (j - p.tick) * TICK - (checked_at - p.wall)
+                for p in self._pendings.values()
+                if p.decision is None and checked_at - p.wall < (j - p.tick) * TICK
+            ]
+            if not waits:
                 break
-            if checked_at - pr.wall >= sim_elapsed:
-                return  # truly not available by this tick: keep previous action
-            # Simulation is ahead of the wall clock: wait for the truth.
-            time.sleep(min(sim_elapsed - (checked_at - pr.wall), 0.0005))
+            # Simulation is ahead of the wall clock for some request: wait.
+            time.sleep(min(min(waits), 0.0005))
 
-        assert pr.latency_s is not None and pr.effective_tick is not None
-        if self._deadline_s is not None and pr.latency_s > self._deadline_s:
-            self.stats.late_dropped += 1
-            self.recorder.event(
-                {
-                    "type": "decision_dropped",
-                    "id": pr.id,
-                    "tick": j,
-                    "reason": "deadline",
-                    "action": None if pr.decision.action is None else pr.decision.action.value,
-                    "latency_ms": pr.latency_s * 1000,
-                }
-            )
-            self._pending = None
+        # 2. Deadline drops, failures, superseded answers; apply the newest.
+        ready: list[_Pending] = []
+        for pr in sorted(self._pendings.values(), key=lambda p: p.id):
+            if pr.decision is None:
+                continue
+            assert pr.latency_s is not None and pr.effective_tick is not None
+            if self._deadline_s is not None and pr.latency_s > self._deadline_s:
+                self._close(pr, "decision_dropped", j, reason="deadline")
+                self.stats.late_dropped += 1
+            elif j >= pr.effective_tick:
+                if pr.decision.action is None:
+                    self._close(pr, "decision_failed", j)
+                    self.stats.failed += 1
+                elif pr.id < self._last_applied_id:
+                    self._close(pr, "decision_superseded", j)
+                    self.stats.superseded += 1
+                else:
+                    ready.append(pr)
+        if not ready:
             return
-        if j < pr.effective_tick:
-            return
+        for old in ready[:-1]:  # several ready at once: only the newest counts
+            self._close(old, "decision_superseded", j)
+            self.stats.superseded += 1
+        self._apply(ready[-1], j)
 
-        if pr.decision.action is None:
-            # Failed request: nothing to apply, previous action continues.
-            self.stats.failed += 1
-            self.recorder.event(
-                {
-                    "type": "decision_failed",
-                    "id": pr.id,
-                    "tick": j,
-                    "error": pr.decision.error,
-                    "latency_ms": pr.latency_s * 1000,
-                    "meta": pr.decision.meta,
-                }
-            )
-            self._pending = None
-            return
+    def _close(self, pr: _Pending, kind: str, j: int, **extra: Any) -> None:
+        d = pr.decision
+        assert d is not None and pr.latency_s is not None
+        self.recorder.event(
+            {
+                "type": kind,
+                "id": pr.id,
+                "request_tick": pr.tick,
+                "tick": j,
+                "action": None if d.action is None else d.action.value,
+                "latency_ms": pr.latency_s * 1000,
+                **({"error": d.error} if d.error else {}),
+                **({"meta": d.meta} if d.meta else {}),
+                **extra,
+            }
+        )
+        del self._pendings[pr.id]
 
-        action = pr.decision.action
+    def _apply(self, pr: _Pending, j: int) -> None:
+        d = pr.decision
+        assert d is not None and d.action is not None and pr.latency_s is not None
+        action = d.action
         self.stats.applied += 1
         self.stats.delay_ticks.append(j - pr.tick)
         self.last_latency_s = pr.latency_s
         self._applied_request_tick = pr.tick
+        self._last_applied_id = pr.id
         if action != self.current_action:
             self.action_changes.append((j, action.value))
         self.current_action = action
@@ -273,10 +300,10 @@ class EpisodeRunner:
                 "applied_tick": j,
                 "action": action.value,
                 "latency_ms": pr.latency_s * 1000,
-                **({"meta": pr.decision.meta} if pr.decision.meta else {}),
+                **({"meta": d.meta} if d.meta else {}),
             }
         )
-        self._pending = None
+        del self._pendings[pr.id]
 
     # ---------------------------------------------------------------- result
     def finish(self) -> dict[str, Any]:
@@ -308,12 +335,14 @@ class EpisodeRunner:
             "missed_slots": st.missed_slots,
             "late_dropped": st.late_dropped,
             "failed_decisions": st.failed,
+            "superseded_decisions": st.superseded,
             "mean_decision_latency_ms": mean(lat_ms),
             "p50_latency_ms": percentile(lat_ms, 50),
             "p95_latency_ms": percentile(lat_ms, 95),
             "mean_delay_ticks": mean(st.delay_ticks),
             "world_speed_scale": cfg.world_speed_scale,
             "decision_hz": cfg.decision_hz,
+            "max_inflight": cfg.max_inflight,
             "obstacle_count": cfg.obstacle_count,
             "final_obstacle_count": len(env.obstacles),
             "action_changes": self.action_changes,

@@ -20,6 +20,8 @@ def add_difficulty_args(ap: argparse.ArgumentParser) -> None:
     g.add_argument("--world-speed", type=float, dest="world_speed_scale")
     g.add_argument("--decision-hz", type=float, dest="decision_hz")
     g.add_argument("--deadline-ms", type=float, dest="decision_deadline_ms")
+    g.add_argument("--max-inflight", type=int, dest="max_inflight",
+                   help="requests a controller may have outstanding at once (default 1)")
     g.add_argument("--target-timeout", type=float, dest="target_timeout")
     g.add_argument("--target-goal", type=int, dest="target_goal")
     g.add_argument("--max-duration", type=float, dest="max_duration")
@@ -48,6 +50,7 @@ DIFFICULTY_FIELDS = (
     "world_speed_scale",
     "decision_hz",
     "decision_deadline_ms",
+    "max_inflight",
     "target_timeout",
     "target_goal",
     "max_duration",

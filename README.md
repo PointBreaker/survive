@@ -144,6 +144,18 @@ through each other. Touching an obstacle ends the episode immediately.
   in flight. A slot that comes while the controller is busy counts as
   *missed* and is served when the controller frees up. So `decision_hz` is a
   maximum rate.
+* `max_inflight` (default 1, `--max-inflight`): how many requests a
+  controller may have outstanding at once. It's given to every controller
+  in `ArenaInfo` and recorded in results. Answers can arrive out of order:
+  the newest ready answer is applied, and an answer to an older request is
+  **superseded** and never applied, so stale information never overwrites
+  fresher. For a high-latency controller this raises the decision rate from
+  about 1/latency toward `decision_hz`. Each answer is still *L* old when it
+  lands.
+* `Observation.control` gives every controller its own-loop feedback: the
+  tick and runner-measured latency (controller and world seconds) of the
+  decision currently in force. It's a fact about the controller's own
+  timing, not about the world.
 * A decision with latency *L* takes effect at tick `request_tick + max(1, ⌈L/tick⌉)`.
   Until then the previous action stays in force. **L is measured by the runner's
   clock** (observation handed over → decision received). Controllers can't
@@ -172,9 +184,19 @@ per-tick `action_changes` for exact replay. There's no composite score.
 ```bash
 cp .env.example .env            # put ONE token in: OPENROUTER_API_KEY=sk-or-...  or  TYPESAFE_API_KEY=...
 python -m arena.jev_check       # 3 real calls: latency, parsed action, raw reply
-python main.py --controller jev
-python -m arena.benchmark --controller jev --episodes 10
+python main.py --controller jev --max-inflight 3
+python -m arena.benchmark --controller jev --episodes 10 --max-inflight 3
 ```
+
+With ~300 ms latency at 10 Hz, `--max-inflight 3` keeps the decision rate
+near 10/s (about 560 requests/min, under the 1,200/min limit). SimpleAvoid
+with 310 ms simulated latency, same 40 seeds, 20 s episodes:
+
+| setting | inflight 1 | 2 | 3 | 4 |
+|---|---|---|---|---|
+| medium | 0.05 | 0.20 | 0.25 | 0.20 |
+| easy | 0.33 | 0.57 | 0.57 | 0.55 |
+| medium, world 0.5× | 0.60 | 0.75 | 0.97 | 0.95 |
 
 `.env` is gitignored. `OPENROUTER_API_KEY` uses
 `https://openrouter.ai/api/alpha/decisions` with `typesafe/jev-1.13`.

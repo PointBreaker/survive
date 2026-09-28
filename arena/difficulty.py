@@ -59,6 +59,7 @@ class DifficultyConfig:
     world_speed_scale: float = 1.0
     decision_hz: float = 10.0
     decision_deadline_ms: Optional[float] = None  # late results are dropped
+    max_inflight: int = 1  # requests a controller may have outstanding at once
 
     # Generator safety (environment-internal, never exposed as advice)
     spawn_safe_radius: float = 180.0
@@ -90,6 +91,8 @@ class DifficultyConfig:
             raise ValueError("world_speed_scale must be > 0")
         if self.decision_hz <= 0:
             raise ValueError("decision_hz must be > 0")
+        if self.max_inflight < 1:
+            raise ValueError("max_inflight must be >= 1")
 
 
 PRESETS: dict[str, DifficultyConfig] = {
