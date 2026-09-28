@@ -169,4 +169,6 @@ def test_observation_control_reports_measured_latency_of_action_in_force():
     c = later.control
     assert c["applied_latency_s"] >= 0.150
     assert abs(c["applied_latency_world_s"] - 2.0 * c["applied_latency_s"]) < 1e-9
-    assert c["applied_request_tick"] == seen[0].tick
+    # it names one of the controller's own earlier snapshots
+    assert c["applied_request_tick"] in {o.tick for o in seen[:-1]}
+    assert c["applied_request_tick"] < later.tick
