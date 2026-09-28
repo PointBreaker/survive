@@ -56,7 +56,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             action, meta = ctrl.decode_decide(payload, i)
             ok += 1
-            print(f"\n[{i}] {ms:.0f} ms  action={action.value}  meta={meta}")
+            conf = (meta or {}).get("confidence")
+            extra = f"  confidence={conf:.2f}" if isinstance(conf, (int, float)) else ""
+            layout = "  (fallback layout, not the documented one)" if (meta or {}).get("layout") else ""
+            print(f"\n[{i}] {ms:.0f} ms  action={action.value}{extra}{layout}")
         except ValueError as e:
             print(f"\n[{i}] {ms:.0f} ms  UNPARSEABLE: {e}")
         print("raw reply: " + json.dumps(payload)[:2000])

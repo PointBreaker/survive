@@ -1,8 +1,11 @@
-"""TypeSafe Jev controller via the OpenRouter decisions API.
+"""TypeSafe Jev controller (OpenRouter or TypeSafe first-party API).
 
-Setup: put your token in ``.env`` at the repo root (see ``.env.example``)::
+Setup: put ONE token in ``.env`` at the repo root (see ``.env.example``)::
 
-    OPENROUTER_API_KEY=sk-or-...
+    OPENROUTER_API_KEY=sk-or-...     # -> https://openrouter.ai/api/alpha/decisions, typesafe/jev-1.13
+    TYPESAFE_API_KEY=...             # -> https://api.typesafe.ai/v1/systemone, jev-latest
+
+If both are set, OpenRouter is used unless JEV_ENDPOINT says otherwise.
 
 Then ``python main.py --controller jev`` or
 ``python -m arena.benchmark --controller jev``. Check connectivity first with
@@ -22,16 +25,28 @@ instructions and criteria only explain the game rules and what each action
 means. They give no strategy, risk hints or recommended direction. The
 full text is in ``INSTRUCTIONS`` / ``ACTION_CRITERIA`` below, open to audit.
 
-Response parsing: we look for the answer to the ``action`` question under
-common layouts (see ``find_action``). If none matches, the decision fails
-(the previous action continues), and the error carries a snippet of the raw
-reply for diagnosis. Nothing is substituted.
+Response: per the TypeSafe docs, a choice answer looks like::
+
+    {"answers": {"action": {"type": "choice", "choice": "NE",
+                            "probabilities": {"N": 0.05, "NE": 0.81, ...},
+                            "confidence": 0.78}}}
+
+We read ``answers.action.choice`` and log ``confidence`` and
+``probabilities`` as decision metadata, so replays can show where Jev was
+unsure. Other common layouts are accepted as a fallback (``find_action``).
+If none matches, the decision fails (the previous action continues), and
+the error carries a snippet of the raw reply. Nothing is substituted, and
+the probabilities are never used to pick an action on Jev's behalf.
 
 Configuration variables (arguments override them):
-    OPENROUTER_API_KEY  required. Bearer token (JEV_API_KEY also accepted)
-    JEV_MODEL           default typesafe/jev-1.13
-    JEV_ENDPOINT        default https://openrouter.ai/api/alpha/decisions
+    OPENROUTER_API_KEY  or TYPESAFE_API_KEY (or JEV_API_KEY): bearer token
+    JEV_MODEL           default depends on provider (see above)
+    JEV_ENDPOINT        default depends on provider (see above)
     JEV_TIMEOUT_S       transport timeout, default 10
+
+Published limits (TypeSafe docs, 2026-09): 70-500 ms per request (p50 around
+200 ms via OpenRouter), 1,200 requests/minute. A single episode at <= 10 Hz
+with one request in flight stays well under that.
 """
 from __future__ import annotations
 
@@ -44,8 +59,12 @@ from arena.observation import ArenaInfo, Observation
 from controllers.remote import RemoteController
 from remote.protocol import ProtocolError
 
-DEFAULT_ENDPOINT = "https://openrouter.ai/api/alpha/decisions"
-DEFAULT_MODEL = "typesafe/jev-1.13"
+PROVIDERS = {
+    # key variable: (endpoint, default model)
+    "OPENROUTER_API_KEY": ("https://openrouter.ai/api/alpha/decisions", "typesafe/jev-1.13"),
+    "TYPESAFE_API_KEY": ("https://api.typesafe.ai/v1/systemone", "jev-latest"),
+}
+DEFAULT_ENDPOINT, DEFAULT_MODEL = PROVIDERS["OPENROUTER_API_KEY"]
 
 INSTRUCTIONS = (
     "You control the player in a real-time 2D top-down arena. `state.rules` holds the fixed rules "
@@ -89,6 +108,15 @@ def _as_action(v: Any) -> Optional[Action]:
                 return a
     if isinstance(v, list) and len(v) == 1:
         return _as_action(v[0])
+    return None
+
+
+def documented_answer(payload: Any, question: str = "action") -> Optional[dict]:
+    """``payload["answers"][question]`` if it is a documented choice answer."""
+    if isinstance(payload, dict) and isinstance(payload.get("answers"), dict):
+        ans = payload["answers"].get(question)
+        if isinstance(ans, dict) and "choice" in ans:
+            return ans
     return None
 
 
@@ -136,14 +164,21 @@ class JevController(RemoteController):
         model: Optional[str] = None,
         timeout_s: Optional[float] = None,
     ):
-        endpoint = endpoint or os.environ.get("JEV_ENDPOINT") or DEFAULT_ENDPOINT
+        default_endpoint, default_model = DEFAULT_ENDPOINT, DEFAULT_MODEL
         if api_key is None:
-            api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("JEV_API_KEY")
+            for var, (ep, mdl) in PROVIDERS.items():
+                if os.environ.get(var):
+                    api_key, default_endpoint, default_model = os.environ[var], ep, mdl
+                    break
+            else:
+                api_key = os.environ.get("JEV_API_KEY")
         if not api_key:
             raise RuntimeError(
-                "No API token: set OPENROUTER_API_KEY in .env (copy .env.example) or the environment."
+                "No API token: set OPENROUTER_API_KEY (or TYPESAFE_API_KEY) in .env "
+                "(copy .env.example) or the environment."
             )
-        self.model = model or os.environ.get("JEV_MODEL") or DEFAULT_MODEL
+        endpoint = endpoint or os.environ.get("JEV_ENDPOINT") or default_endpoint
+        self.model = model or os.environ.get("JEV_MODEL") or default_model
         timeout = timeout_s if timeout_s is not None else float(os.environ.get("JEV_TIMEOUT_S") or 10)
         super().__init__(endpoint=endpoint, timeout_s=timeout, headers={"Authorization": f"Bearer {api_key}"})
         self._rules: dict[str, Any] = {}
@@ -166,11 +201,20 @@ class JevController(RemoteController):
         }
 
     def decode_decide(self, payload: Any, request_id: int) -> tuple[Action, Optional[dict]]:
-        action = find_action(payload)
-        if action is None:
-            snippet = json.dumps(payload)[:300]
-            raise ProtocolError(f"no valid 'action' answer in reply: {snippet}")
-        meta = {}
+        meta: dict[str, Any] = {}
+        ans = documented_answer(payload)
+        if ans is not None:
+            action = _as_action(ans.get("choice"))
+            if action is None:
+                raise ProtocolError(f"invalid choice {ans.get('choice')!r} in reply: {json.dumps(payload)[:300]}")
+            for k in ("confidence", "probabilities"):
+                if k in ans:
+                    meta[k] = ans[k]
+        else:
+            action = find_action(payload)
+            if action is None:
+                raise ProtocolError(f"no valid 'action' answer in reply: {json.dumps(payload)[:300]}")
+            meta["layout"] = "fallback"
         if isinstance(payload, dict):
             for k in ("id", "model", "usage"):
                 if k in payload:

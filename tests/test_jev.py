@@ -66,7 +66,7 @@ def stub_factory():
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
-    for k in ("OPENROUTER_API_KEY", "JEV_API_KEY", "JEV_MODEL", "JEV_ENDPOINT", "JEV_TIMEOUT_S"):
+    for k in ("OPENROUTER_API_KEY", "TYPESAFE_API_KEY", "JEV_API_KEY", "JEV_MODEL", "JEV_ENDPOINT", "JEV_TIMEOUT_S"):
         monkeypatch.delenv(k, raising=False)
 
 
@@ -81,6 +81,31 @@ def test_defaults_point_at_openrouter(monkeypatch):
     assert c.endpoint == "https://openrouter.ai/api/alpha/decisions"
     assert c.model == "typesafe/jev-1.13"
     assert c._headers["Authorization"] == "Bearer tok"
+
+
+def test_typesafe_key_selects_first_party_api(monkeypatch):
+    monkeypatch.setenv("TYPESAFE_API_KEY", "ts")
+    c = JevController()
+    assert c.endpoint == "https://api.typesafe.ai/v1/systemone"
+    assert c.model == "jev-latest"
+    assert c._headers["Authorization"] == "Bearer ts"
+
+
+def test_documented_choice_answer_is_parsed_with_confidence():
+    c = JevController(endpoint="http://127.0.0.1:1/x", api_key="tok")
+    reply = {"id": "r1", "answers": {"action": {
+        "type": "choice", "choice": "NE",
+        "probabilities": {"NE": 0.81, "N": 0.1, "E": 0.09}, "confidence": 0.78}}}
+    action, meta = c.decode_decide(reply, 0)
+    assert action is Action.NE
+    assert meta["confidence"] == 0.78 and meta["probabilities"]["NE"] == 0.81 and meta["id"] == "r1"
+    assert "layout" not in meta
+
+
+def test_documented_answer_with_invalid_choice_fails():
+    c = JevController(endpoint="http://127.0.0.1:1/x", api_key="tok")
+    with pytest.raises(ValueError):
+        c.decode_decide({"answers": {"action": {"type": "choice", "choice": "UP"}}}, 0)
 
 
 def test_dotenv_loads_token_without_overriding(tmp_path, monkeypatch):
@@ -156,7 +181,8 @@ def test_http_error_is_failed_decision(stub_factory):
 
 
 def test_episode_runs_end_to_end_with_stub(stub_factory):
-    stub = stub_factory(lambda body: (200, {"answers": {"action": "E"}, "id": "x", "usage": {"tokens": 1}}))
+    stub = stub_factory(lambda body: (200, {"id": "x", "answers": {"action": {
+        "type": "choice", "choice": "E", "probabilities": {"E": 0.9, "W": 0.1}, "confidence": 0.9}}}))
     c = JevController(endpoint=stub.url, api_key="tok")
     result = EpisodeRunner(Environment(DifficultyConfig(max_duration=3), 1), c).run()
     c.close()

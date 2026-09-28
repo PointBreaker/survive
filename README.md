@@ -141,18 +141,20 @@ per-tick `action_changes` for exact replay. There's no composite score.
 
 ### Out-of-process controllers (Jev)
 
-**Running Jev (TypeSafe Jev via OpenRouter):**
+**Running Jev (TypeSafe Jev via OpenRouter or the first-party API):**
 
 ```bash
-cp .env.example .env            # then put your token in: OPENROUTER_API_KEY=sk-or-...
+cp .env.example .env            # put ONE token in: OPENROUTER_API_KEY=sk-or-...  or  TYPESAFE_API_KEY=...
 python -m arena.jev_check       # 3 real calls: latency, parsed action, raw reply
 python main.py --controller jev
 python -m arena.benchmark --controller jev --episodes 10
 ```
 
-`.env` is gitignored. Optional overrides go there too: `JEV_MODEL` (default
-`typesafe/jev-1.13`), `JEV_ENDPOINT` (default
-`https://openrouter.ai/api/alpha/decisions`), `JEV_TIMEOUT_S`.
+`.env` is gitignored. `OPENROUTER_API_KEY` uses
+`https://openrouter.ai/api/alpha/decisions` with `typesafe/jev-1.13`.
+`TYPESAFE_API_KEY` uses `https://api.typesafe.ai/v1/systemone` with `jev-latest`.
+Optional overrides: `JEV_MODEL`, `JEV_ENDPOINT`, `JEV_TIMEOUT_S`. Published
+figures: 70–500 ms per request (p50 around 200 ms on OpenRouter), 1,200 req/min.
 
 Each decision is one stateless POST in the decisions-API shape:
 
@@ -167,11 +169,13 @@ Each decision is one stateless POST in the decisions-API shape:
   (`controllers/jev.py`: `INSTRUCTIONS`, `ACTION_CRITERIA`) only explain the
   rules and what each action does. A test makes sure they contain no strategy
   words (safe, danger, avoid, nearest, recommend, ...).
-* The reply is searched for the answer to `action` under common layouts
-  (`{"action": ..}`, `{"answers": {"action": ..}}`, `{..: {"value": ..}}`, ...).
-  If none matches, the decision fails and the raw snippet goes into the
-  event log. `jev_check` prints the full raw reply, so a new format is easy
-  to adapt to.
+* The reply's documented form is
+  `{"answers": {"action": {"type": "choice", "choice": "NE", "probabilities": {..}, "confidence": 0.78}}}`.
+  The runner applies `choice`, and `confidence` and `probabilities` are logged
+  per decision (for "where was Jev unsure" analysis). They never select an
+  action. Other layouts are accepted as a fallback, and `jev_check` flags it
+  when one is used. An unparseable reply is a failed decision with the raw
+  snippet in the event log.
 * The HTTP call runs on a worker thread, and the runner times the whole round
   trip. Transport and network are part of the latency.
 * Any failure (HTTP error, timeout, bad JSON, unknown action, service down) is
