@@ -41,6 +41,7 @@ class SimpleAvoidController(SyncController):
         slow_radius: float = 120.0,
         compensate_latency: bool = True,
         max_lead: float = 0.4,
+        lead_rule: str = "latency_hold",
     ):
         super().__init__()
         self.margin = margin
@@ -52,6 +53,7 @@ class SimpleAvoidController(SyncController):
         self.slow_radius = slow_radius
         self.compensate_latency = compensate_latency
         self.max_lead = max_lead
+        self.lead_rule = lead_rule
 
     def reset(self, info: ArenaInfo) -> None:
         super().reset(info)
@@ -67,8 +69,16 @@ class SimpleAvoidController(SyncController):
 
         lead = 0.0
         if self.compensate_latency and self._prev_tick is not None:
-            gap_ticks = observation.tick - self._prev_tick
-            lead = min(self.max_lead, gap_ticks / self.info.physics_hz * self.info.world_speed_scale)
+            tick_s = self.info.world_speed_scale / self.info.physics_hz
+            gap_world = (observation.tick - self._prev_tick) * tick_s
+            lat_world = observation.control.get("applied_latency_world_s")
+            if self.lead_rule == "gap" or lat_world is None:
+                lead = gap_world
+            elif self.lead_rule == "latency":
+                lead = lat_world
+            else:  # latency + half the interval this action will be held
+                lead = lat_world + 0.5 * gap_world
+            lead = min(self.max_lead, lead)
         self._prev_tick = observation.tick
         px, py = px + pvx * lead, py + pvy * lead
 

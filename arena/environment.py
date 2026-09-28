@@ -15,7 +15,7 @@ from arena import physics
 from arena.action import ALL_ACTIONS, Action
 from arena.difficulty import DifficultyConfig
 from arena.entities import Obstacle, Player, Target
-from arena.observation import ArenaInfo, Observation
+from arena.observation import EMPTY_CONTROL, ArenaInfo, Observation
 
 
 @dataclass
@@ -95,8 +95,11 @@ class Environment:
         )
 
     # ------------------------------------------------------------ observation
-    def observe(self) -> Observation:
-        """Snapshot of current objective state, built from fresh primitives."""
+    def observe(self, control: Optional[dict] = None) -> Observation:
+        """Snapshot of current objective state, built from fresh primitives.
+
+        ``control`` is the runner's own-loop feedback; the environment only
+        passes it through."""
         p = self.player
         t = self.target
         return Observation(
@@ -110,6 +113,7 @@ class Environment:
             ),
             arena={"width": self.config.arena_width, "height": self.config.arena_height},
             score=self.score,
+            control=dict(control) if control else dict(EMPTY_CONTROL),
         )
 
     # ------------------------------------------------------------------- step

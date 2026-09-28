@@ -147,3 +147,26 @@ def test_controller_cannot_report_itself_faster():
         runner.step_tick()
     assert runner.last_latency_s >= 0.1
     assert decision_ticks(runner)[0] >= 6
+
+
+def test_observation_control_reports_measured_latency_of_action_in_force():
+    seen = []
+
+    class Recorder_(SyncController):
+        name = "rec"
+
+        def decide(self, observation):
+            seen.append(observation)
+            return Action.N
+
+    env = env_with_moving_obstacle(world_speed_scale=2.0)
+    runner = EpisodeRunner(env, LatencyWrapper(Recorder_(), 150))
+    runner.start()
+    for _ in range(40):
+        runner.step_tick()
+    first, later = seen[0], seen[-1]
+    assert first.control["applied_latency_s"] is None and first.control["applied_request_tick"] is None
+    c = later.control
+    assert c["applied_latency_s"] >= 0.150
+    assert abs(c["applied_latency_world_s"] - 2.0 * c["applied_latency_s"]) < 1e-9
+    assert c["applied_request_tick"] == seen[0].tick

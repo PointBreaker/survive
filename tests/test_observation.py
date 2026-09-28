@@ -32,7 +32,8 @@ def test_observation_has_no_forbidden_keys_and_only_primitives():
         if not isinstance(v, (dict, list, tuple)):
             assert isinstance(v, (numbers.Number, str)) or v is None, (path, k, type(v))
     assert not keys & FORBIDDEN_KEYS
-    assert set(d) == {"timestamp", "tick", "player", "target", "obstacles", "arena", "score"}
+    assert set(d) == {"timestamp", "tick", "player", "target", "obstacles", "arena", "score", "control"}
+    assert set(d["control"]) == {"applied_request_tick", "applied_latency_s", "applied_latency_world_s"}
     assert set(d["player"]) == {"x", "y", "vx", "vy", "radius"}
     assert set(d["target"]) == {"x", "y", "radius"}
     for o in d["obstacles"]:

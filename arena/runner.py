@@ -88,6 +88,7 @@ class EpisodeRunner:
         env, cfg = self.env, self.env.config
         self.current_action = Action.STAY
         self.last_latency_s: Optional[float] = None
+        self._applied_request_tick: Optional[int] = None
         self.stats = DecisionStats()
         self.action_changes: list[tuple[int, str]] = [(0, Action.STAY.value)]
         self._pending: Optional[_Pending] = None
@@ -178,8 +179,16 @@ class EpisodeRunner:
             )
 
     # ------------------------------------------------------------- decisions
+    def _control_feedback(self) -> dict[str, Any]:
+        lat = self.last_latency_s
+        return {
+            "applied_request_tick": self._applied_request_tick,
+            "applied_latency_s": lat,
+            "applied_latency_world_s": None if lat is None else lat * self.env.config.world_speed_scale,
+        }
+
     def _issue_request(self, k: int) -> None:
-        obs = self.env.observe()
+        obs = self.env.observe(self._control_feedback())
         rid = self._next_id
         self._next_id += 1
         self.stats.requests += 1
@@ -252,6 +261,7 @@ class EpisodeRunner:
         self.stats.applied += 1
         self.stats.delay_ticks.append(j - pr.tick)
         self.last_latency_s = pr.latency_s
+        self._applied_request_tick = pr.tick
         if action != self.current_action:
             self.action_changes.append((j, action.value))
         self.current_action = action

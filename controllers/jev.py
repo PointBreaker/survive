@@ -18,6 +18,11 @@ Each decision is one stateless POST::
      "state": {"rules": ArenaInfo, "observation": Observation},
      "questions": {"action": {"type": "choice", "instructions": ..., "criteria": {...9 actions}}}}
 
+Latency awareness: ``state.observation.control`` carries the runner-measured
+latency of Jev's previous answer (the same own-loop feedback every
+controller receives), and the instructions say what it means. It is a fact
+about Jev's own timing, not advice about the world.
+
 Fairness: ``state`` carries exactly what every controller gets, the public
 rules (``ArenaInfo.to_dict()``, which in-process controllers receive at
 reset) and the raw observation (``Observation.to_dict()``), unmodified. The
@@ -74,7 +79,10 @@ INSTRUCTIONS = (
     "lines and bounce off the arena edges. Touching any obstacle immediately ends the episode in "
     "failure. Touching the target scores one point and a new target appears; going longer than "
     "`rules.target_timeout` world seconds without scoring also ends the episode in failure. "
-    "Surviving until `rules.max_duration` is success. The world keeps moving while you decide. "
+    "Surviving until `rules.max_duration` is success. The world keeps moving while you decide: "
+    "`state.observation.control.applied_latency_world_s` is how many world seconds your previous "
+    "answer took to take effect after its snapshot, so the world will have moved on by roughly that "
+    "much before this answer takes effect (null before your first answer has taken effect). "
     "Choose the player's thrust direction: it is applied as acceleration "
     "(`rules.player_acceleration`, with drag `rules.player_drag` and speed cap "
     "`rules.player_max_speed`) from the moment your answer arrives until your next answer arrives."
