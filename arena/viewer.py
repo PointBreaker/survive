@@ -107,7 +107,7 @@ def run_viewer(path: Path | str, start: Optional[str] = None, max_frames: int = 
     from arena.app import run_app
 
     episode_dirs(Path(path))  # fail early with a clear message
-    run_app(start="replay", replay_path=Path(path), replay_at=start, panel=panel, max_frames=max_frames,
+    run_app(replay_path=Path(path), replay_at=start, panel=panel, max_frames=max_frames,
             screenshot=screenshot, window=window)
 
 

@@ -1,16 +1,16 @@
-"""Decision Arena desktop app.
+"""Decision Arena desktop console (one page: parameters · arena · inspector).
 
-    python main.py                                   # launcher: click to configure and start
-    python main.py --controller jev --max-inflight 3 # straight into a game (Esc -> launcher)
+    python main.py                                   # open the console, pick and press Start
+    python main.py --controller jev --max-inflight 3 # preselect and start immediately
     python main.py --controller human
 
 In a game: the right-hand inspector panel shows every request/response live.
 The faded "ghost" in the arena is the snapshot the controller is currently
 deciding on; the gap between ghost and reality is the latency being paid.
 
-Keys: WASD / arrows move (human), R restart, N next seed, - / = world speed
-(restarts on the same seed), J cycle panel, G ghost, P probability compass,
-F1 debug overlay, V replay the finished episode, Esc back to the launcher.
+Keys: Space start/stop, WASD / arrows move (human), R restart, N next seed,
+- / = world speed (restarts on the same seed), J cycle panel, G ghost,
+P probability compass, F1 debug overlay, V replay the finished episode.
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ INTERACTIVE_CONTROLLERS = ("human", "random", "greedy", "simple_avoid", "sleep",
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--controller", choices=INTERACTIVE_CONTROLLERS, default=None,
-                    help="start a game directly with this controller (default: open the launcher)")
+                    help="preselect this controller and start immediately")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="runs")
     ap.add_argument("--no-log", action="store_true", help="do not write run logs")
@@ -55,7 +55,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     if not pinned:
         settings.base = None
-    return run_app(settings, start="play" if args.controller else "menu", panel=args.panel,
+    return run_app(settings, autostart=args.controller is not None, panel=args.panel,
                    max_frames=args.frames, screenshot=args.screenshot, window=window)
 
 

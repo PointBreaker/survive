@@ -110,7 +110,10 @@ class Display:
             pygame.display.flip()
 
     def save(self, path: str) -> None:
-        pygame.image.save(self.surface, path)
+        # Save what the screen shows: RGB only (the frame is fully opaque anyway).
+        img = pygame.Surface(self.surface.get_size(), 0, 32)
+        img.blit(self.surface, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
+        pygame.image.save(img, path)
 
     def set_title(self, title: str) -> None:
         if self.backend == "sdl2":

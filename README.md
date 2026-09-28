@@ -22,8 +22,8 @@ slow controller.
 ```bash
 pip install -r requirements.txt
 
-python main.py                             # launcher: click a controller + parameters, press Start
-python main.py --controller human          # or go straight into a game (Esc -> launcher)
+python main.py                             # console: parameters · arena · inspector on one page
+python main.py --controller human          # preselect a controller and start right away
 python main.py --controller simple_avoid --world-speed 2
 
 python -m arena.benchmark --controller simple_avoid --episodes 50
@@ -64,7 +64,7 @@ arena/
   observation.py          PUBLIC interface: Observation, ArenaInfo, FORBIDDEN_KEYS
   runner.py               closed loop: decision slots, async latency accounting
   recorder.py             JSONL run logs      replay.py   deterministic re-simulation
-  app.py                  desktop app: launcher, play and replay scenes
+  app.py                  desktop console: one page (parameters · arena · inspector), live + replay
   display.py              high-DPI window + vsync presentation (SDL2), classic fallback
   ui.py                   theme + small immediate-mode widgets
   renderer.py             arena / HUD / inspector / timeline drawing (visual only)
@@ -87,27 +87,35 @@ benchmark/
 tests/                    physics, collision, observation, determinism, isolation, async, headless
 ```
 
-## Desktop app (GUI)
+## Desktop console (GUI)
 
-`python main.py` opens the **launcher**:
-* **Controller cards:** Human, SimpleAvoid, Greedy, Random, Jev. The Jev card
-  shows whether a token was found in `.env`, and "Check connection" makes
-  one real call and reports latency and the parsed answer.
-* **Parameters:** click to set difficulty preset, obstacle count, world
-  speed, decision rate, requests in flight, added latency, episode length,
-  seed, and whether to save logs.
-* **Recent runs:** click one to open it in the replay viewer.
+`python main.py` opens one page with three columns:
 
-In a game, the bottom bar has Menu / Restart / Next seed and **world speed −/+**.
-Changing the speed restarts the episode on the same seed, because world speed
-is a rule every controller is told at the start. When an episode ends, a card
-offers Replay / Restart / Next seed / Menu. Keys: R, N, `-`/`=`, J, G, P, F1,
-V, Esc.
+* **Left (parameters):**
+  - Controller: Human, SimpleAvoid, Greedy, Random, Jev. For Jev it shows
+    whether a token was found in `.env`, and "Check connection" makes one
+    real call and reports latency and the parsed answer.
+  - Start/Stop, Restart, Next seed.
+  - Difficulty preset, obstacles, world speed, decision rate, requests in
+    flight, added latency, episode length, seed, and whether to save logs.
+  - Recent runs.
+  - The column scrolls with the mouse wheel on short windows.
+* **Centre:** the arena, live, or the replay of a saved run.
+* **Right:** the inspector (see below).
+
+Parameter changes take effect immediately by restarting the episode on the
+same seed, because they are rules every controller is told at the start. A
+running episode keeps running. Switching controller waits for Start, so
+picking Jev never starts API calls by itself. When an episode ends, a card
+offers Replay / Restart / Next seed. Replay runs in the centre column; "Exit
+replay" returns to live. Keys: Space start/stop, R, N, `-`/`=` world speed,
+J, G, P, F1, V.
 
 Rendering:
 * The window is created in high-DPI mode, so on Retina screens drawing
   happens at real pixel density instead of being OS-upscaled.
-* Shapes are antialiased and nothing is rescaled.
+* Shapes are antialiased: circles are supersampled sprites, alpha-blended
+  into an opaque frame. Nothing is rescaled.
 * Motion is interpolated between physics ticks. This is visual only; the
   simulation is untouched.
 * Frames are presented with vsync, and the window is resizable.

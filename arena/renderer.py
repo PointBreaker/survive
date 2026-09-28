@@ -26,7 +26,6 @@ from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
 import pygame
-import pygame.gfxdraw
 
 from arena.action import Action
 from arena.environment import Environment
@@ -97,6 +96,7 @@ class Layout:
     timeline: pygame.Rect
     panel: pygame.Rect
     hud_controls_x: int  # scene buttons may use hud from here to the right
+    sidebar: Optional[pygame.Rect] = None  # left column, drawn by the scene
     card: Optional[pygame.Rect] = None  # end-of-episode card (if drawn)
     card_buttons_y: int = 0
 
@@ -112,8 +112,10 @@ class Renderer:
         self.show_timeline = show_timeline
         self.t = Theme(display.density)
         self._grid_cache: tuple[tuple, Optional[pygame.Surface]] = ((), None)
+        self._sprites: dict[tuple, pygame.Surface] = {}
         self.timeline_reserve = 0
         self.timeline_pt = self.TIMELINE_PT  # scenes may make it taller to host controls above the track
+        self.left_pt = 0  # width of a scene-drawn left sidebar
 
     # ================================================================ layout
     def layout(self, world_w: float, world_h: float) -> Layout:
@@ -121,18 +123,22 @@ class Renderer:
         if t.d != self.display.density:
             self.t = t = Theme(self.display.density)
         W, H = self.display.size
+        left = min(t.u(self.left_pt), W // 3)
         panel_w = t.u(self.PANEL_PT) if self.show_panel else 0
-        panel_w = min(panel_w, W // 2)
-        hud = pygame.Rect(0, 0, W - panel_w, t.u(self.HUD_PT))
+        panel_w = min(panel_w, (W - left) // 2)
+        cw = W - panel_w - left  # centre column
+        hud = pygame.Rect(left, 0, cw, t.u(self.HUD_PT))
         tl_h = t.u(self.timeline_pt) if self.show_timeline else 0
-        area = pygame.Rect(0, hud.bottom, W - panel_w, H - hud.bottom - tl_h)
+        area = pygame.Rect(left, hud.bottom, cw, H - hud.bottom - tl_h)
         m = t.u(10)
         s = max(0.05, min((area.w - 2 * m) / world_w, (area.h - 2 * m) / world_h))
         aw, ah = int(world_w * s), int(world_h * s)
         arena = pygame.Rect(area.x + (area.w - aw) // 2, area.y + (area.h - ah) // 2, aw, ah)
-        timeline = pygame.Rect(0, area.bottom, W - panel_w, tl_h)
+        timeline = pygame.Rect(left, area.bottom, cw, tl_h)
         panel = pygame.Rect(W - panel_w, 0, panel_w, H)
-        return Layout(W, H, hud, area, arena, s, timeline, panel, hud_controls_x=int(hud.w * 0.52))
+        sidebar = pygame.Rect(0, 0, left, H)
+        return Layout(W, H, hud, area, arena, s, timeline, panel, hud_controls_x=hud.x + int(hud.w * 0.52),
+                      sidebar=sidebar)
 
     # ================================================================= frame
     def draw(
@@ -190,15 +196,36 @@ class Renderer:
             self._grid_cache = (key, g)
         return self._grid_cache[1]
 
-    @staticmethod
-    def _disc(surf, color, c, r) -> None:
-        r = max(1, int(r))
-        pygame.gfxdraw.filled_circle(surf, c[0], c[1], r, color)
-        pygame.gfxdraw.aacircle(surf, c[0], c[1], r, color)
+    def _sprite(self, color, r: int, filled: bool) -> pygame.Surface:
+        """Antialiased circle on a transparent sprite, cached by (color, radius).
 
-    @staticmethod
-    def _ring(surf, color, c, r) -> None:
-        pygame.gfxdraw.aacircle(surf, c[0], c[1], max(1, int(r)), color)
+        Blitting (alpha-blending) the sprite mixes edge pixels with whatever
+        is underneath and keeps the frame opaque. gfxdraw's AA shapes write
+        partial alpha instead of blending, which left speckled edges.
+        """
+        key = (color, r, filled)
+        spr = self._sprites.get(key)
+        if spr is None:
+            if len(self._sprites) > 2000:
+                self._sprites.clear()
+            # Supersample 4x and downsample: exact edge coverage, no holes.
+            k = 4
+            size = 2 * r + 3
+            big = pygame.Surface((size * k, size * k), pygame.SRCALPHA, 32)
+            centre = ((r + 1.5) * k, (r + 1.5) * k)
+            width = 0 if filled else max(1, int(round(1.3 * k * max(1.0, self.t.d))))
+            pygame.draw.circle(big, color, centre, r * k, width)
+            spr = pygame.transform.smoothscale(big, (size, size))
+            self._sprites[key] = spr
+        return spr
+
+    def _disc(self, surf, color, c, r) -> None:
+        r = max(1, int(round(r)))
+        surf.blit(self._sprite(color, r, True), (c[0] - r - 1, c[1] - r - 1))
+
+    def _ring(self, surf, color, c, r) -> None:
+        r = max(1, int(round(r)))
+        surf.blit(self._sprite(color, r, False), (c[0] - r - 1, c[1] - r - 1))
 
     def _draw_world(self, surf, L: Layout, env, action, alpha, debug, inspector, last_applied) -> None:
         t, cfg = self.t, env.config
@@ -276,8 +303,8 @@ class Renderer:
         pygame.draw.rect(surf, SURFACE, L.hud)
         pygame.draw.line(surf, BORDER, L.hud.bottomleft, L.hud.bottomright, max(1, t.u(1)))
         prev_clip = surf.get_clip()
-        surf.set_clip(pygame.Rect(0, 0, max(0, L.hud.w - reserve - t.u(12)), L.hud.h))
-        x, y = t.u(16), t.u(9)
+        surf.set_clip(pygame.Rect(L.hud.x, 0, max(0, L.hud.w - reserve - t.u(12)), L.hud.h))
+        x, y = L.hud.x + t.u(16), t.u(9)
         r = t.text(surf, controller_name, (x, y), TEXT, 16, bold=True)
         since = env.world_time - env.last_target_time
         timer_col = WARN if since > cfg.target_timeout * 0.7 else MUTED

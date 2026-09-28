@@ -1,16 +1,14 @@
-"""Decision Arena desktop app: launcher menu, live play, replay, in one window.
+"""Decision Arena desktop console: one page, three columns.
 
-    python main.py                      # opens the launcher
-    python main.py --controller jev     # skips straight into a game (Esc -> launcher)
+    python main.py                      # open the console
+    python main.py --controller jev     # open it with Jev selected and start right away
 
-Scenes:
-* MenuScene: pick a controller (Human / SimpleAvoid / Greedy / Random / Jev)
-  and click to set the parameters; browse and replay recent runs.
-* PlayScene: the live arena with the inspector panel. World speed can be
-  changed with the HUD buttons; that restarts the episode on the same seed,
-  because world speed is a rule every controller is told at the start.
-* ReplayScene: exact re-simulation of a logged episode with transport
-  controls.
+* Left: controller, parameters, run controls, Jev connection check, recent
+  runs. Parameter changes restart the episode on the same seed, because they
+  are rules every controller is told at the start (a running episode keeps
+  running; switching controller waits for Start).
+* Centre: the live arena, or the replay of a saved run (same column).
+* Right: the inspector: requests in flight, responses, latency, raw JSON.
 
 All of this is presentation. Episodes still run through the same
 EpisodeRunner with the same rules as the headless benchmark.
@@ -197,246 +195,8 @@ class App:
         return self.clock.get_fps()
 
 
-# ================================================================= menu
-class MenuScene:
-    def __init__(self, app: App, error: Optional[str] = None):
-        self.app = app
-        self.s = app.settings
-        self.error = error
-        self.check: Optional[str] = None
-        self.checking = False
-        self.runs = recent_runs(self.s.out)
 
-    # -------------------------------------------------------------- input
-    def handle(self, ev) -> None:
-        if ev.type == pygame.KEYDOWN:
-            if ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
-                self.start()
-            elif ev.key == pygame.K_ESCAPE:
-                self.app.running = False
-        elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
-            h = self.app.ui.hit(ev.px)
-            if h:
-                self.on(*h)
-
-    def on(self, key: str, v: Any) -> None:
-        s = self.s
-        self.error = None
-        if key == "controller":
-            s.controller = v
-            if v == "human":
-                s.decision_hz, s.max_inflight = 60.0, 1
-            elif s.decision_hz == 60.0:
-                s.decision_hz = 10.0
-            self.check = None
-        elif key == "preset":
-            s.preset, s.base = v, None
-            s.obstacles = PRESETS[v].obstacle_count
-        elif key == "obstacles_step":
-            s.obstacles = max(0, min(400, s.obstacles + v * (1 if s.obstacles < 20 else 5)))
-        elif key == "obstacles":
-            s.obstacles = v
-        elif key == "speed":
-            s.world_speed = v
-        elif key == "hz":
-            s.decision_hz = v
-        elif key == "inflight":
-            s.max_inflight = v
-        elif key == "latency":
-            s.latency_ms = v
-        elif key == "duration":
-            s.max_duration = v
-        elif key == "seed":
-            s.seed = max(0, s.seed + v)
-        elif key == "logs":
-            s.save_logs = v
-        elif key == "start":
-            self.start()
-        elif key == "check":
-            self.run_check()
-        elif key == "replay":
-            self.app.switch(ReplayScene(self.app, v, back=lambda: MenuScene(self.app)))
-        elif key == "quit":
-            self.app.running = False
-
-    def start(self) -> None:
-        factory, err = self.s.controller_factory()
-        if err:
-            self.error = err
-            return
-        self.app.switch(PlayScene(self.app, self.s, factory))
-
-    def run_check(self) -> None:
-        """One real Jev call in the background: latency + parsed answer."""
-        if self.checking:
-            return
-        self.checking, self.check = True, "calling Jev…"
-
-        def work():
-            try:
-                from arena.environment import Environment
-                from controllers.jev import JevController
-
-                c = JevController(endpoint=self.s.endpoint)
-                env = Environment(self.s.config(), 0)
-                c.reset(env.public_info())
-                t0 = time.perf_counter()
-                d = c.decide(env.observe())
-                ms = (time.perf_counter() - t0) * 1000
-                c.close()
-                if d.action is None:
-                    self.check = f"failed after {ms:.0f} ms: {d.error}"
-                else:
-                    conf = (d.meta or {}).get("confidence")
-                    cs = f", confidence {conf:.2f}" if isinstance(conf, (int, float)) else ""
-                    self.check = f"OK · {ms:.0f} ms · answered {d.action.value}{cs}"
-            except Exception as e:
-                self.check = f"error: {e}"
-            self.checking = False
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def update(self) -> None:
-        pass
-
-    # --------------------------------------------------------------- draw
-    def draw(self) -> None:
-        app, t, ui, s = self.app, self.app.t, self.app.ui, self.s
-        surf = app.display.surface
-        W, H = surf.get_size()
-        surf.fill(BG)
-        content_w = min(W - t.u(64), t.u(1240))
-        x0 = (W - content_w) // 2
-        y = t.u(36)
-        t.text(surf, "Decision Arena", (x0, y), TEXT, 30, bold=True)
-        t.text(surf, "real-time closed-loop decision benchmark", (x0, y + t.u(40)), MUTED, 14)
-        y += t.u(84)
-
-        left_w = int(content_w * 0.44)
-        rx = x0 + left_w + t.u(40)
-        right_w = content_w - left_w - t.u(40)
-
-        # ---- controllers
-        t.text(surf, "CONTROLLER", (x0, y), FAINT, 11.5, bold=True)
-        cy = y + t.u(22)
-        cw = (left_w - t.u(12)) // 2
-        ch = t.u(64)
-        ok, jev_msg = jev_status()
-        for i, (key, title, desc) in enumerate(CONTROLLERS):
-            r = pygame.Rect(x0 + (i % 2) * (cw + t.u(12)), cy + (i // 2) * (ch + t.u(12)), cw, ch)
-            self._card(surf, r, key, title, jev_msg if key == "jev" else desc,
-                       warn=(key == "jev" and not ok))
-        cy += 3 * (ch + t.u(12))
-        if s.controller == "jev":
-            b = pygame.Rect(x0, cy, t.u(150), t.u(30))
-            ui.button(surf, b, "Check connection", "check", enabled=ok and not self.checking, size=12.5)
-            if self.check:
-                col = OK if self.check.startswith("OK") else (MUTED if self.checking else BAD)
-                self._wrap(surf, self.check, (b.right + t.u(12), b.y + t.u(7)), left_w - b.w - t.u(12), col, 12)
-            cy += t.u(44)
-
-        # ---- recent runs
-        t.text(surf, "RECENT RUNS  (click to replay)", (x0, cy + t.u(8)), FAINT, 11.5, bold=True)
-        ry = cy + t.u(30)
-        if not self.runs:
-            t.text(surf, "no saved runs yet", (x0, ry), FAINT, 12.5)
-        for path, label in self.runs:
-            if ry > H - t.u(60):
-                break
-            r = pygame.Rect(x0, ry, left_w, t.u(26))
-            hover = r.collidepoint(ui.mouse)
-            if hover:
-                pygame.draw.rect(surf, SURFACE_2, r, border_radius=t.u(5))
-            t.text(surf, label, (r.x + t.u(8), r.centery), ACCENT if hover else MUTED, 12, mono=True, anchor="midleft")
-            ui.hits.append((r, "replay", path, True))
-            ry += t.u(28)
-
-        # ---- parameters
-        t.text(surf, "PARAMETERS", (rx, y), FAINT, 11.5, bold=True)
-        py = y + t.u(24)
-        lx = rx
-        cx = rx + t.u(130)
-        row = t.u(44)
-
-        def label(text, sub=None):
-            t.text(surf, text, (lx, py + t.u(6)), TEXT, 13.5)
-            if sub:
-                t.text(surf, sub, (lx, py + t.u(24)), FAINT, 11.5)
-
-        label("Difficulty", "preset")
-        ui.chips(surf, cx, py, [(p, p) for p in ("easy", "medium", "hard")], s.preset if s.base is None else None,
-                 "preset", min_w=70)
-        py += row
-        label("Obstacles")
-        end = ui.stepper(surf, cx, py, f"{s.obstacles}", "obstacles_step", w=50)
-        ui.chips(surf, cx + t.u(130), py, [(n, str(n)) for n in (5, 10, 20, 40, 80)], s.obstacles, "obstacles",
-                 min_w=38)
-        py += row
-        label("World speed", "world time vs real time")
-        ui.chips(surf, cx, py, [(v, f"{v:g}×") for v in (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)], s.world_speed, "speed",
-                 min_w=46)
-        py += row
-        label("Decision rate", "max requests/s")
-        ui.chips(surf, cx, py, [(v, f"{v:g} Hz") for v in (2.0, 5.0, 10.0, 20.0, 60.0)], s.decision_hz, "hz",
-                 min_w=52)
-        py += row
-        label("In flight", "concurrent requests")
-        ui.chips(surf, cx, py, [(v, str(v)) for v in (1, 2, 3, 4)], s.max_inflight, "inflight", min_w=40)
-        py += row
-        label("Added latency", "simulated, on top")
-        ui.chips(surf, cx, py, [(v, f"{v:g} ms" if v else "none") for v in (0.0, 100.0, 200.0, 300.0, 500.0)],
-                 s.latency_ms, "latency", min_w=52)
-        py += row
-        label("Episode length", "world seconds")
-        ui.chips(surf, cx, py, [(v, f"{v:g} s") for v in (20.0, 60.0, 120.0)], s.max_duration, "duration", min_w=52)
-        py += row
-        label("Seed")
-        ui.stepper(surf, cx, py, str(s.seed), "seed", w=60)
-        py += row
-        ui.toggle(surf, cx, py + t.u(3), "save run logs (for replay)", s.save_logs, "logs")
-        py += row + t.u(8)
-
-        start = pygame.Rect(cx, py, t.u(240), t.u(52))
-        name = dict((k, n) for k, n, _ in CONTROLLERS)[s.controller]
-        ui.button(surf, start, f"Start  ·  {name}", "start", kind="primary", size=15, hint="press Enter")
-        ui.button(surf, pygame.Rect(start.right + t.u(12), py, t.u(90), t.u(52)), "Quit", "quit", size=13)
-        py += t.u(66)
-        if self.error:
-            self._wrap(surf, self.error, (cx, py), right_w - t.u(130), BAD, 12.5)
-        elif s.controller == "human":
-            t.text(surf, "Human input is read at 60 Hz. Move with WASD or the arrow keys.", (cx, py), MUTED, 12)
-        elif s.controller == "jev" and s.max_inflight == 1:
-            t.text(surf, "Tip: with ~300 ms latency, 3 requests in flight keeps decisions near 10/s.", (cx, py),
-                   MUTED, 12)
-
-    def _card(self, surf, r, key, title, desc, warn=False) -> None:
-        t, ui = self.app.t, self.app.ui
-        sel = self.s.controller == key
-        hover = r.collidepoint(ui.mouse)
-        pygame.draw.rect(surf, (30, 44, 66) if sel else (SURFACE_2 if hover else SURFACE), r, border_radius=t.u(10))
-        pygame.draw.rect(surf, ACCENT if sel else BORDER, r, width=max(1, t.u(2 if sel else 1)),
-                         border_radius=t.u(10))
-        t.text(surf, title, (r.x + t.u(14), r.y + t.u(12)), TEXT, 15, bold=True)
-        t.text(surf, desc, (r.x + t.u(14), r.y + t.u(36)), WARN if warn else MUTED, 11.5)
-        ui.hits.append((r, "controller", key, True))
-
-    def _wrap(self, surf, text, pos, width, color, size) -> None:
-        t = self.app.t
-        x, y = pos
-        line = ""
-        for word in text.split():
-            trial = (line + " " + word).strip()
-            if t.text_width(trial, size) > width and line:
-                t.text(surf, line, (x, y), color, size)
-                y += t.u(size + 5)
-                line = word
-            else:
-                line = trial
-        if line:
-            t.text(surf, line, (x, y), color, size)
-
-
-# ================================================================= play
+# ============================================================== helpers
 def controller_header(ctrl) -> list[str]:
     inner = ctrl
     while hasattr(inner, "inner"):
@@ -470,363 +230,603 @@ def raw_traffic(ctrl, inspector: Inspector):
     return req, resp
 
 
-class PlayScene:
-    def __init__(self, app: App, settings: Settings, factory, panel: str = "decisions"):
+
+# ============================================================== console
+class ConsoleScene:
+    """One page: parameters (left) · arena (centre) · inspector (right).
+
+    Live mode states: ``ready`` (world shown, not running), ``running``,
+    ``finished``. Replay mode re-simulates a saved run in the centre column.
+    """
+
+    SIDEBAR_PT = 330
+    REPLAY_SPEEDS = (0.1, 0.25, 0.5, 1.0, 2.0, 4.0)
+
+    def __init__(self, app: App, autostart: bool = False, panel: str = "decisions"):
         self.app = app
-        self.s = settings
-        self.factory = factory
-        self.cfg = settings.config()
+        self.s = app.settings
         self.debug, self.ghost, self.compass = False, True, True
         self.panel_mode = PANEL_MODES.index(panel)
+        self.error: Optional[str] = None
+        self.check: Optional[str] = None
+        self.checking = False
+        self.scroll = 0
+        self.sidebar_content_h = 0
+        self.layout = None
+        self.mode = "live"
         self.runner = None
-        app.renderer.timeline_pt = 92
-        self.new_episode(settings.seed)
+        self.rec = None
+        self.pb = None
+        self.runs = recent_runs(self.s.out)
+        app.renderer.left_pt = self.SIDEBAR_PT
+        app.renderer.timeline_pt = Renderer.TIMELINE_PT
+        self.prepare(self.s.seed)
+        if autostart:
+            self.start()
 
-    def new_episode(self, seed: int) -> None:
+    # ================================================================ live
+    def prepare(self, seed: int) -> None:
+        """Show a fresh world for (settings, seed) without running it."""
+        from arena.environment import Environment
+
+        self.stop_episode()
+        self.seed = seed
+        self.s.seed = seed
+        self.cfg = self.s.config()
+        self.env = Environment(self.cfg, seed)
+        self.inspector = Inspector()
+        self.state = "ready"
+        self.result = None
+        self.run_dir = None
+        self.header: list[str] = []
+        self.max_ticks = int(self.cfg.max_duration / self.cfg.world_speed_scale * 60)
+
+    def start(self) -> None:
         from arena.environment import Environment
         from arena.runner import EpisodeRunner
 
-        self.close()
-        self.seed = seed
-        ctrl = self.factory()
-        self.run_dir = new_run_dir(self.s.out, ctrl.name, f"seed{seed}") if self.s.save_logs else None
+        if self.mode != "live":
+            self.exit_replay()
+        if self.state != "ready":
+            self.prepare(self.seed)
+        factory, err = self.s.controller_factory()
+        if err:
+            self.error = err
+            return
+        self.error = None
+        ctrl = factory()
+        self.run_dir = new_run_dir(self.s.out, ctrl.name, f"seed{self.seed}") if self.s.save_logs else None
         inner = JsonlRecorder(self.run_dir) if self.run_dir else NullRecorder()
         self.inspector = Inspector()
         self.rec = TeeRecorder(inner, self.inspector)
-        self.runner = EpisodeRunner(Environment(self.cfg, seed), ctrl, recorder=self.rec, realtime=True)
+        self.env = Environment(self.cfg, self.seed)
+        self.runner = EpisodeRunner(self.env, ctrl, recorder=self.rec, realtime=True)
         self.runner.start()
         self.header = controller_header(ctrl)
-        self.finished = False
-        self.result = None
-        self.max_ticks = int(self.cfg.max_duration / self.cfg.world_speed_scale * 60)
+        self.state = "running"
+
+    def stop_episode(self) -> None:
+        if self.runner is not None:
+            if self.state == "running":
+                self.runner.finish()
+            self.runner.controller.close()
+            self.rec.close()
+        self.runner = None
+        self.rec = None
+
+    def restart(self, seed: Optional[int] = None) -> None:
+        self.prepare(self.seed if seed is None else seed)
+        self.start()
+
+    def settings_changed(self, keep_running: bool = True) -> None:
+        was_running = self.mode == "live" and self.state == "running"
+        self.prepare(self.seed)
+        if was_running and keep_running:
+            self.start()
 
     def close(self) -> None:
-        if self.runner is None:
-            return
-        if not self.finished:
-            self.runner.finish()
-        self.runner.controller.close()
-        self.rec.close()
-        self.runner = None
+        self.stop_episode()
+        self.app.renderer.left_pt = 0
 
-    # -------------------------------------------------------------- input
-    def handle(self, ev) -> None:
-        if ev.type == pygame.KEYDOWN:
-            k = ev.key
-            if k == pygame.K_ESCAPE:
-                self.to_menu()
-            elif k == pygame.K_r:
-                self.new_episode(self.seed)
-            elif k == pygame.K_n:
-                self.new_episode(self.seed + 1)
-            elif k in (pygame.K_MINUS, pygame.K_KP_MINUS):
-                self.change_speed(-1)
-            elif k in (pygame.K_EQUALS, pygame.K_PLUS, pygame.K_KP_PLUS):
-                self.change_speed(+1)
-            elif k == pygame.K_j:
-                self.panel_mode = (self.panel_mode + 1) % len(PANEL_MODES)
-            elif k == pygame.K_g:
-                self.ghost = not self.ghost
-            elif k == pygame.K_p:
-                self.compass = not self.compass
-            elif k in (pygame.K_F1, pygame.K_TAB):
-                self.debug = not self.debug
-            elif k == pygame.K_v and self.finished and self.run_dir:
-                self.replay()
-        elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
-            h = self.app.ui.hit(ev.px)
-            if not h:
-                return
-            key, v = h
-            if key == "menu":
-                self.to_menu()
-            elif key == "restart":
-                self.new_episode(self.seed)
-            elif key == "next":
-                self.new_episode(self.seed + 1)
-            elif key == "speed":
-                self.change_speed(v)
-            elif key == "replay":
-                self.replay()
-
-    def change_speed(self, direction: int) -> None:
-        cur = self.cfg.world_speed_scale
-        steps = list(SPEED_STEPS)
-        i = min(range(len(steps)), key=lambda j: abs(steps[j] - cur))
-        i = max(0, min(len(steps) - 1, i + direction))
-        if steps[i] == cur:
-            return
-        self.s.world_speed = steps[i]
-        self.cfg = replace(self.cfg, world_speed_scale=steps[i])
-        self.new_episode(self.seed)
-        self.app.notify(f"World speed {steps[i]:g}×: episode restarted on seed {self.seed} "
-                        f"(controllers are told the speed at the start)")
-
-    def to_menu(self) -> None:
-        self.s.seed = self.seed
-        self.app.switch(MenuScene(self.app))
-
-    def replay(self) -> None:
-        run_dir, s, factory = self.run_dir, self.s, self.factory
-        self.app.switch(ReplayScene(self.app, run_dir, back=lambda: PlayScene(self.app, s, factory)))
-
-    # ------------------------------------------------------------- update
-    def update(self) -> None:
-        if self.finished or self.runner is None:
-            return
-        self.runner.advance_realtime()
-        if self.runner.env.done:
-            self.result = self.runner.finish()
-            self.rec.close()
-            self.finished = True
-
-    # --------------------------------------------------------------- draw
-    def draw(self) -> None:
-        app, t, ui = self.app, self.app.t, self.app.ui
-        r = self.runner
-        env = r.env
-        alpha = 0.0
-        if not self.finished:
-            alpha = max(0.0, min(1.0, (time.perf_counter() - r.wall_origin) / TICK - env.tick))
-        lat = None if r.last_latency_s is None else r.last_latency_s * 1000
-        req, resp = raw_traffic(r.controller, self.inspector)
-        card = None
-        if self.finished and self.result:
-            res = self.result
-            card = [f"survived {res['survival_time']:.1f} s   ·   {res['targets_collected']} targets",
-                    f"{res['decision_count']} decisions   ·   mean latency "
-                    f"{(res['mean_decision_latency_ms'] or 0):.0f} ms",
-                    f"seed {res['seed']}   ·   world {self.cfg.world_speed_scale:g}×"]
-        L = app.renderer.draw(
-            env, r.controller.name, r.current_action.value, lat, alpha=alpha, debug=self.debug,
-            inspector=self.inspector, ghost=self.ghost, compass=self.compass,
-            panel_mode=PANEL_MODES[self.panel_mode], header=self.header, raw_request=req, raw_response=resp,
-            timeline=timeline_data(self.inspector, self.max_ticks, env.tick,
-                                   f"live · tick {env.tick} · timeline spans the full episode length"),
-            fps=app.fps, card_lines=card,
-        )
-        surf = app.display.surface
-        # Controls row above the timeline track.
-        bh, gap = t.u(30), t.u(6)
-        y = L.timeline.y + t.u(10)
-        x = L.timeline.x + t.u(12)
-        for key, label, w in (("menu", "‹ Menu", 74), ("restart", "Restart  R", 92), ("next", "Next seed  N", 106)):
-            rect = pygame.Rect(x, y, t.u(w), bh)
-            ui.button(surf, rect, label, key, size=12.5)
-            x = rect.right + gap
-        x += t.u(14)
-        lab = t.text(surf, "world speed", (x, y + bh // 2), MUTED, 12, anchor="midleft")
-        x = lab.right + t.u(8)
-        ui.button(surf, pygame.Rect(x, y, bh, bh), "−", "speed", -1, size=15)
-        val = pygame.Rect(x + bh + t.u(4), y, t.u(52), bh)
-        pygame.draw.rect(surf, SURFACE_2, val, border_radius=t.u(6))
-        t.text(surf, f"{self.cfg.world_speed_scale:g}×", val.center, TEXT, 13, bold=True, anchor="center")
-        ui.button(surf, pygame.Rect(val.right + t.u(4), y, bh, bh), "+", "speed", +1, size=15)
-        # End-of-episode card buttons
-        if L.card is not None:
-            labels = [("replay", "Replay  V"), ("restart", "Restart  R"), ("next", "Next seed  N"), ("menu", "Menu")]
-            if not self.run_dir:
-                labels = labels[1:]
-            bw = (L.card.w - t.u(24) - gap * (len(labels) - 1)) // len(labels)
-            bx = L.card.x + t.u(12)
-            for i, (key, label) in enumerate(labels):
-                ui.button(surf, pygame.Rect(bx, L.card_buttons_y, bw, t.u(36)), label, key,
-                          kind="primary" if i == 0 else "normal", size=12.5)
-                bx += bw + gap
-
-
-# =============================================================== replay
-class ReplayScene:
-    SPEEDS = (0.1, 0.25, 0.5, 1.0, 2.0, 4.0)
-
-    def __init__(self, app: App, path, back=None, start: Optional[str] = None, panel: str = "decisions"):
+    # ============================================================== replay
+    def open_replay(self, path) -> None:
         from arena.viewer import Playback, episode_dirs
 
-        self.app = app
-        self.back = back
-        self.dirs = episode_dirs(Path(path))
-        self.ep = 0
-        self._Playback = Playback
-        self.pb = Playback(self.dirs[0])
-        self.tick = 0.0
-        self.playing = True
-        self.speed = 1.0
-        self.debug, self.ghost, self.compass = False, True, True
-        self.panel_mode = PANEL_MODES.index(panel)
-        self.dragging = False
-        self.layout = None
+        try:
+            dirs = episode_dirs(Path(path))
+        except SystemExit as e:
+            self.error = str(e)
+            return
+        self.stop_episode()
+        self.state = "ready"
+        self.mode = "replay"
+        self.dirs, self.ep = dirs, 0
+        self.pb = Playback(dirs[0])
+        self.rtick, self.playing, self.rspeed = 0.0, True, 1.0
         self.last_time = time.perf_counter()
-        app.renderer.timeline_pt = 92
-        if start == "collision":
-            self.jump_collision()
+        self.dragging = False
+        self.app.renderer.timeline_pt = 92
+
+    def exit_replay(self) -> None:
+        self.mode = "live"
+        self.pb = None
+        self.app.renderer.timeline_pt = Renderer.TIMELINE_PT
+        self.prepare(self.seed)
+
+    def replay_episode(self, i: int) -> None:
+        from arena.viewer import Playback
+
+        self.ep = i % len(self.dirs)
+        self.pb = Playback(self.dirs[self.ep])
+        self.rtick, self.playing = 0.0, True
 
     def jump_collision(self) -> None:
-        if self.pb.collision_tick is not None:
-            self.tick, self.playing = float(max(0, self.pb.collision_tick - 120)), False
-
-    def set_episode(self, i: int) -> None:
-        self.ep = i % len(self.dirs)
-        self.pb = self._Playback(self.dirs[self.ep])
-        self.tick, self.playing = 0.0, True
-
-    def close(self) -> None:
-        self.app.renderer.timeline_pt = Renderer.TIMELINE_PT
-
-    def go_back(self) -> None:
-        self.app.switch(self.back() if self.back else MenuScene(self.app))
+        if self.pb and self.pb.collision_tick is not None:
+            self.rtick, self.playing = float(max(0, self.pb.collision_tick - 120)), False
 
     def step_decision(self, direction: int) -> None:
         import bisect
 
         dt = self.pb.decision_ticks
         if direction > 0:
-            i = bisect.bisect_right(dt, int(self.tick))
+            i = bisect.bisect_right(dt, int(self.rtick))
             if i < len(dt):
-                self.tick = float(dt[i])
+                self.rtick = float(dt[i])
         else:
-            i = bisect.bisect_left(dt, int(self.tick)) - 1
+            i = bisect.bisect_left(dt, int(self.rtick)) - 1
             if i >= 0:
-                self.tick = float(dt[i])
+                self.rtick = float(dt[i])
         self.playing = False
 
+    def toggle_play(self) -> None:
+        if self.rtick >= self.pb.total:
+            self.rtick = 0.0
+        self.playing = not self.playing
+
+    # =============================================================== input
     def handle(self, ev) -> None:
         if ev.type == pygame.KEYDOWN:
-            k, shift = ev.key, ev.mod & pygame.KMOD_SHIFT
-            if k in (pygame.K_ESCAPE, pygame.K_q):
-                self.go_back()
+            self.on_key(ev.key, ev.mod & pygame.KMOD_SHIFT)
+        elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+            h = self.app.ui.hit(ev.px)
+            if h:
+                self.on(*h)
+            elif self.mode == "replay" and self.layout is not None and self.layout.timeline.collidepoint(ev.px):
+                self.dragging, self.playing = True, False
+                self.rtick = float(self.app.renderer.timeline_tick_at(self.layout, ev.px[0], self.pb.total))
+        elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1 and self.mode == "replay":
+            self.dragging = False
+        elif ev.type == pygame.MOUSEMOTION and self.mode == "replay" and self.dragging and self.layout:
+            self.rtick = float(self.app.renderer.timeline_tick_at(self.layout, ev.px[0], self.pb.total))
+        elif ev.type == pygame.MOUSEWHEEL and self.layout is not None and self.layout.sidebar is not None:
+            if self.layout.sidebar.collidepoint(self.app.ui.mouse):
+                max_scroll = max(0, self.sidebar_content_h - self.layout.sidebar.h)
+                self.scroll = max(0, min(max_scroll, self.scroll - ev.y * self.app.t.u(40)))
+
+    def on_key(self, k, shift) -> None:
+        if k == pygame.K_j:
+            self.panel_mode = (self.panel_mode + 1) % len(PANEL_MODES)
+        elif k == pygame.K_g:
+            self.ghost = not self.ghost
+        elif k == pygame.K_p:
+            self.compass = not self.compass
+        elif k in (pygame.K_F1, pygame.K_TAB):
+            self.debug = not self.debug
+        elif self.mode == "replay":
+            if k == pygame.K_ESCAPE:
+                self.exit_replay()
             elif k == pygame.K_SPACE:
                 self.toggle_play()
             elif k == pygame.K_RIGHT:
-                self.tick, self.playing = min(self.pb.total, int(self.tick) + (10 if shift else 1)), False
+                self.rtick, self.playing = min(self.pb.total, int(self.rtick) + (10 if shift else 1)), False
             elif k == pygame.K_LEFT:
-                self.tick, self.playing = max(0, int(self.tick) - (10 if shift else 1)), False
+                self.rtick, self.playing = max(0, int(self.rtick) - (10 if shift else 1)), False
             elif k == pygame.K_PERIOD:
                 self.step_decision(+1)
             elif k == pygame.K_COMMA:
                 self.step_decision(-1)
-            elif k == pygame.K_RIGHTBRACKET:
-                self.speed = self.SPEEDS[min(len(self.SPEEDS) - 1, self.SPEEDS.index(self.speed) + 1)]
-            elif k == pygame.K_LEFTBRACKET:
-                self.speed = self.SPEEDS[max(0, self.SPEEDS.index(self.speed) - 1)]
-            elif k == pygame.K_HOME:
-                self.tick = 0.0
-            elif k == pygame.K_END:
-                self.tick, self.playing = float(self.pb.total), False
             elif k == pygame.K_c:
                 self.jump_collision()
             elif k in (pygame.K_PAGEDOWN, pygame.K_PAGEUP) and len(self.dirs) > 1:
-                self.set_episode(self.ep + (1 if k == pygame.K_PAGEDOWN else -1))
-            elif k == pygame.K_j:
-                self.panel_mode = (self.panel_mode + 1) % len(PANEL_MODES)
-            elif k == pygame.K_g:
-                self.ghost = not self.ghost
-            elif k == pygame.K_p:
-                self.compass = not self.compass
-            elif k in (pygame.K_F1, pygame.K_TAB):
-                self.debug = not self.debug
-        elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
-            h = self.app.ui.hit(ev.px)
-            if h:
-                key, v = h
-                if key == "back":
-                    self.go_back()
-                elif key == "play":
-                    self.toggle_play()
-                elif key == "dec":
-                    self.step_decision(v)
-                elif key == "crash":
-                    self.jump_collision()
-                elif key == "rspeed":
-                    self.speed = v
-                elif key == "ep":
-                    self.set_episode(self.ep + v)
-            elif self.layout is not None and self.layout.timeline.collidepoint(ev.px):
-                self.dragging, self.playing = True, False
-                self.tick = float(self.app.renderer.timeline_tick_at(self.layout, ev.px[0], self.pb.total))
-        elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
-            self.dragging = False
-        elif ev.type == pygame.MOUSEMOTION and self.dragging and self.layout is not None:
-            self.tick = float(self.app.renderer.timeline_tick_at(self.layout, ev.px[0], self.pb.total))
+                self.replay_episode(self.ep + (1 if k == pygame.K_PAGEDOWN else -1))
+        else:
+            if k in (pygame.K_SPACE, pygame.K_RETURN, pygame.K_KP_ENTER):
+                if self.state == "running":
+                    self.prepare(self.seed)
+                else:
+                    self.start()
+            elif k == pygame.K_r:
+                self.restart()
+            elif k == pygame.K_n:
+                self.restart(self.seed + 1)
+            elif k in (pygame.K_MINUS, pygame.K_KP_MINUS):
+                self.step_speed(-1)
+            elif k in (pygame.K_EQUALS, pygame.K_PLUS, pygame.K_KP_PLUS):
+                self.step_speed(+1)
+            elif k == pygame.K_v and self.state == "finished" and self.run_dir:
+                self.open_replay(self.run_dir)
+            elif k == pygame.K_ESCAPE and self.state == "running":
+                self.prepare(self.seed)
 
-    def toggle_play(self) -> None:
-        if self.tick >= self.pb.total:
-            self.tick = 0.0
-        self.playing = not self.playing
+    def step_speed(self, direction: int) -> None:
+        steps = list(SPEED_STEPS)
+        i = min(range(len(steps)), key=lambda j: abs(steps[j] - self.s.world_speed))
+        i = max(0, min(len(steps) - 1, i + direction))
+        if steps[i] != self.s.world_speed:
+            self.s.world_speed = steps[i]
+            self.settings_changed()
 
+    def on(self, key: str, v: Any) -> None:
+        s = self.s
+        if key == "controller":
+            s.controller = v
+            if v == "human":
+                s.decision_hz, s.max_inflight = 60.0, 1
+            elif s.decision_hz == 60.0:
+                s.decision_hz = 10.0
+            self.check, self.error = None, None
+            if self.mode == "replay":
+                self.exit_replay()
+            else:
+                self.settings_changed(keep_running=False)
+            return
+        param_keys = {"preset", "obstacles", "obstacles_step", "speed", "hz", "inflight", "latency", "duration",
+                      "seed", "logs"}
+        if key in param_keys:
+            if key == "preset":
+                s.preset, s.base = v, None
+                s.obstacles = PRESETS[v].obstacle_count
+            elif key == "obstacles_step":
+                s.obstacles = max(0, min(400, s.obstacles + v * (1 if s.obstacles < 20 else 5)))
+            elif key == "obstacles":
+                s.obstacles = v
+            elif key == "speed":
+                s.world_speed = v
+            elif key == "hz":
+                s.decision_hz = v
+            elif key == "inflight":
+                s.max_inflight = v
+            elif key == "latency":
+                s.latency_ms = v
+            elif key == "duration":
+                s.max_duration = v
+            elif key == "seed":
+                self.seed = max(0, self.seed + v)
+            elif key == "logs":
+                s.save_logs = v
+            if self.mode == "replay":
+                self.exit_replay()
+            else:
+                self.settings_changed()
+            return
+        if key == "start":
+            self.start()
+        elif key == "stop":
+            self.prepare(self.seed)
+        elif key == "restart":
+            self.restart()
+        elif key == "next":
+            self.restart(self.seed + 1)
+        elif key == "check":
+            self.run_check()
+        elif key == "open_run":
+            self.open_replay(v)
+        elif key == "replay_last" and self.run_dir:
+            self.open_replay(self.run_dir)
+        elif key == "exit_replay":
+            self.exit_replay()
+        elif key == "play":
+            self.toggle_play()
+        elif key == "dec":
+            self.step_decision(v)
+        elif key == "crash":
+            self.jump_collision()
+        elif key == "rspeed":
+            self.rspeed = v
+        elif key == "ep":
+            self.replay_episode(self.ep + v)
+        elif key == "quit":
+            self.app.running = False
+
+    def run_check(self) -> None:
+        """One real Jev call in the background: latency + parsed answer."""
+        if self.checking:
+            return
+        self.checking, self.check = True, "calling Jev…"
+        cfg = self.cfg
+
+        def work():
+            try:
+                from arena.environment import Environment
+                from controllers.jev import JevController
+
+                c = JevController(endpoint=self.s.endpoint)
+                env = Environment(cfg, 0)
+                c.reset(env.public_info())
+                t0 = time.perf_counter()
+                d = c.decide(env.observe())
+                ms = (time.perf_counter() - t0) * 1000
+                c.close()
+                if d.action is None:
+                    self.check = f"failed after {ms:.0f} ms: {d.error}"
+                else:
+                    conf = (d.meta or {}).get("confidence")
+                    cs = f", confidence {conf:.2f}" if isinstance(conf, (int, float)) else ""
+                    self.check = f"OK · {ms:.0f} ms · answered {d.action.value}{cs}"
+            except Exception as e:
+                self.check = f"error: {e}"
+            self.checking = False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ============================================================== update
     def update(self) -> None:
-        now = time.perf_counter()
-        dt = min(0.1, now - self.last_time)
-        self.last_time = now
-        if self.playing:
-            self.tick += self.speed * dt * 60.0  # frame-rate independent playback
-            if self.tick >= self.pb.total:
-                self.tick, self.playing = float(self.pb.total), False
+        if self.mode == "replay":
+            now = time.perf_counter()
+            dt = min(0.1, now - self.last_time)
+            self.last_time = now
+            if self.playing:
+                self.rtick += self.rspeed * dt * 60.0
+                if self.rtick >= self.pb.total:
+                    self.rtick, self.playing = float(self.pb.total), False
+            return
+        if self.state != "running" or self.runner is None:
+            return
+        self.runner.advance_realtime()
+        if self.runner.env.done:
+            self.result = self.runner.finish()
+            self.rec.close()
+            self.runner.controller.close()
+            self.state = "finished"
+            self.runs = recent_runs(self.s.out)
 
+    # ================================================================ draw
     def draw(self) -> None:
+        if self.mode == "replay":
+            L = self.draw_replay_centre()
+        else:
+            L = self.draw_live_centre()
+        self.layout = L
+        self.draw_sidebar(L)
+
+    def draw_live_centre(self):
+        app, t, ui = self.app, self.app.t, self.app.ui
+        env = self.env
+        r = self.runner
+        alpha = 0.0
+        if self.state == "running" and r is not None:
+            alpha = max(0.0, min(1.0, (time.perf_counter() - r.wall_origin) / TICK - env.tick))
+        lat = None if (r is None or r.last_latency_s is None) else r.last_latency_s * 1000
+        action = r.current_action.value if r is not None else "STAY"
+        name = r.controller.name if r is not None else self.s.controller
+        req, resp = raw_traffic(r.controller, self.inspector) if r is not None else (None, None)
+        card = None
+        if self.state == "finished" and self.result:
+            res = self.result
+            card = [f"survived {res['survival_time']:.1f} s   ·   {res['targets_collected']} targets",
+                    f"{res['decision_count']} decisions   ·   mean latency "
+                    f"{(res['mean_decision_latency_ms'] or 0):.0f} ms",
+                    f"seed {res['seed']}   ·   world {self.cfg.world_speed_scale:g}×"]
+        label = {"ready": "ready · press Start or Space", "running": f"live · tick {env.tick}",
+                 "finished": f"finished · tick {env.tick}"}[self.state]
+        L = app.renderer.draw(
+            env, name, action, lat, alpha=alpha, debug=self.debug, inspector=self.inspector, ghost=self.ghost,
+            compass=self.compass, panel_mode=PANEL_MODES[self.panel_mode], header=self.header,
+            raw_request=req, raw_response=resp, fps=app.fps, card_lines=card,
+            timeline=timeline_data(self.inspector, self.max_ticks, env.tick,
+                                   label + " · timeline spans the full episode length"),
+        )
+        surf = app.display.surface
+        if self.state == "ready":
+            box = pygame.Rect(0, 0, t.u(360), t.u(96))
+            box.center = L.arena.center
+            pygame.draw.rect(surf, SURFACE, box, border_radius=t.u(12))
+            pygame.draw.rect(surf, BORDER, box, width=max(1, t.u(1)), border_radius=t.u(12))
+            nm = dict((k, n) for k, n, _ in CONTROLLERS).get(self.s.controller, self.s.controller)
+            t.text(surf, f"Ready: {nm} · seed {self.seed}", (box.centerx, box.y + t.u(16)), TEXT, 14, bold=True,
+                   anchor="midtop")
+            b = pygame.Rect(0, 0, t.u(150), t.u(36))
+            b.midbottom = (box.centerx, box.bottom - t.u(14))
+            ui.button(surf, b, "Start  (Space)", "start", kind="primary", size=13)
+        if L.card is not None:
+            gap = t.u(6)
+            labels = [("replay_last", "Replay  V"), ("restart", "Restart  R"), ("next", "Next seed  N")]
+            if not self.run_dir:
+                labels = labels[1:]
+            bw = (L.card.w - t.u(24) - gap * (len(labels) - 1)) // len(labels)
+            bx = L.card.x + t.u(12)
+            for i, (key, lab) in enumerate(labels):
+                ui.button(surf, pygame.Rect(bx, L.card_buttons_y, bw, t.u(36)), lab, key,
+                          kind="primary" if i == 0 else "normal", size=12.5)
+                bx += bw + gap
+        return L
+
+    def draw_replay_centre(self):
         app, t, ui = self.app, self.app.t, self.app.ui
         pb = self.pb
-        tk = int(self.tick)
+        tk = int(self.rtick)
         env = pb.env_at(tk)
         ins = pb.inspector_at(tk)
         last = ins.last_applied()
         req = ins.inflight() or (ins.requests.get(ins.records[-1].id) if ins.records else None)
         raw_req = {"observation": req["observation"]} if req else None
         raw_resp = {k: v for k, v in ins.records[-1].__dict__.items() if v is not None} if ins.records else None
-        state = "playing" if self.playing else "paused"
-        label = (f"replay · {state} {self.speed:g}× · tick {tk}/{pb.total} ({tk * TICK:.2f} s controller time) · "
+        st = "playing" if self.playing else "paused"
+        label = (f"replay · {st} {self.rspeed:g}× · tick {tk}/{pb.total} ({tk * TICK:.2f} s) · "
                  f"episode {self.ep + 1}/{len(self.dirs)} · {pb.run_dir.name}")
-        alpha = (self.tick - tk) if self.playing else 0.0
-        self.layout = L = app.renderer.draw(
-            env, f"replay · {pb.controller}", pb.action_at(tk), last.latency_ms if last else None, alpha=alpha,
-            debug=self.debug, inspector=ins, ghost=self.ghost, compass=self.compass,
-            panel_mode=PANEL_MODES[self.panel_mode], header=[f"seed {pb.seed}", ",/. decision  ←/→ tick  C crash"],
+        L = app.renderer.draw(
+            env, f"replay · {pb.controller}", pb.action_at(tk), last.latency_ms if last else None,
+            alpha=(self.rtick - tk) if self.playing else 0.0, debug=self.debug, inspector=ins, ghost=self.ghost,
+            compass=self.compass, panel_mode=PANEL_MODES[self.panel_mode], header=[f"seed {pb.seed}"],
             raw_request=raw_req, raw_response=raw_resp, timeline=timeline_data(ins, pb.total, tk, label),
-            fps=app.fps, hud_reserve=t.u(70 + (180 if len(self.dirs) > 1 else 0)))
+            fps=app.fps)
         surf = app.display.surface
         bh, gap = t.u(30), t.u(6)
-        # HUD (right): back + episode switching
-        y = L.hud.y + (L.hud.h - bh) // 2
-        x = L.hud.right - t.u(12)
-
-        def btn(label, key, v=None, w=40, selected=False, kind="normal", row_y=None):
-            nonlocal x
-            r = pygame.Rect(x - t.u(w), row_y if row_y is not None else y, t.u(w), bh)
-            ui.button(surf, r, label, key, v, selected=selected, kind=kind, size=12.5)
-            x = r.x - gap
-
-        btn("‹ Back", "back", w=70)
+        y = L.timeline.y + t.u(10)
+        x = L.timeline.x + t.u(12)
+        items = [("‹ Exit replay", "exit_replay", None, 104, "normal"), ("|‹", "dec", -1, 36, "normal"),
+                 ("Pause" if self.playing else "Play", "play", None, 60, "primary"), ("›|", "dec", +1, 36, "normal"),
+                 ("crash", "crash", None, 56, "normal")]
         if len(self.dirs) > 1:
-            btn("next ep ›", "ep", +1, w=84)
-            btn("‹ prev ep", "ep", -1, w=84)
-        # Timeline (left): transport controls
-        ty = L.timeline.y + t.u(10)
-        items = [("|‹", "dec", -1, 36, "normal"), ("Pause" if self.playing else "Play", "play", None, 60, "primary"),
-                 ("›|", "dec", +1, 36, "normal"), ("crash", "crash", None, 56, "normal")]
-        cx = L.timeline.x + t.u(12)
-        for label, key, v, w, kind in items:
-            r = pygame.Rect(cx, ty, t.u(w), bh)
-            ui.button(surf, r, label, key, v, kind=kind, size=12.5)
-            cx = r.right + gap
-        cx += t.u(8)
-        for v in self.SPEEDS:
-            r = pygame.Rect(cx, ty, t.u(42), bh)
-            ui.button(surf, r, f"{v:g}×", "rspeed", v, selected=(v == self.speed), size=12)
-            cx = r.right + t.u(4)
+            items += [("‹ ep", "ep", -1, 46, "normal"), ("ep ›", "ep", +1, 46, "normal")]
+        for lab, key, v, w, kind in items:
+            rect = pygame.Rect(x, y, t.u(w), bh)
+            if rect.right > L.timeline.right - t.u(8):
+                break
+            ui.button(surf, rect, lab, key, v, kind=kind, size=12.5)
+            x = rect.right + gap
+        x += t.u(8)
+        for v in self.REPLAY_SPEEDS:
+            rect = pygame.Rect(x, y, t.u(42), bh)
+            if rect.right > L.timeline.right - t.u(8):
+                break
+            ui.button(surf, rect, f"{v:g}×", "rspeed", v, selected=(v == self.rspeed), size=12)
+            x = rect.right + t.u(4)
+        return L
+
+    # ------------------------------------------------------------- sidebar
+    def draw_sidebar(self, L) -> None:
+        app, t, ui, s = self.app, self.app.t, self.app.ui, self.s
+        surf = app.display.surface
+        sb = L.sidebar
+        pygame.draw.rect(surf, SURFACE, sb)
+        pygame.draw.line(surf, BORDER, sb.topright, sb.bottomright, max(1, t.u(1)))
+        prev_clip = surf.get_clip()
+        surf.set_clip(sb)
+        x = sb.x + t.u(18)
+        w = sb.w - t.u(36)
+        y0 = t.u(16) - self.scroll
+        y = y0
+
+        t.text(surf, "Decision Arena", (x, y), TEXT, 19, bold=True)
+        y += t.u(34)
+
+        def section(title):
+            nonlocal y
+            t.text(surf, title, (x, y), FAINT, 11, bold=True)
+            y += t.u(20)
+
+        def chips(options, selected, key, min_w=38):
+            nonlocal y
+            y = ui.chips(surf, x, y, options, selected, key, min_w=min_w, h=26, size=12) + t.u(12)
+
+        def label(text, right=None):
+            nonlocal y
+            t.text(surf, text, (x, y), MUTED, 12)
+            if right:
+                t.text(surf, right, (x + w, y), TEXT, 12, bold=True, anchor="topright")
+            y += t.u(18)
+
+        # ---- controller
+        section("CONTROLLER")
+        ok, jev_msg = jev_status()
+        cw = (w - t.u(8)) // 2
+        for i, (key, title, _) in enumerate(CONTROLLERS):
+            r = pygame.Rect(x + (i % 2) * (cw + t.u(8)), y + (i // 2) * t.u(36), cw, t.u(30))
+            ui.button(surf, r, title, "controller", key, selected=(s.controller == key), size=12.5)
+        y += t.u(36) * ((len(CONTROLLERS) + 1) // 2) + t.u(2)
+        desc = dict((k, d) for k, _, d in CONTROLLERS)[s.controller]
+        t.text(surf, jev_msg if s.controller == "jev" else desc, (x, y), WARN if (s.controller == "jev" and not ok)
+               else MUTED, 11.5)
+        y += t.u(20)
+        if s.controller == "jev":
+            b = pygame.Rect(x, y, t.u(140), t.u(28))
+            ui.button(surf, b, "Check connection", "check", enabled=ok and not self.checking, size=12)
+            y += t.u(34)
+            if self.check:
+                col = OK if self.check.startswith("OK") else (MUTED if self.checking else BAD)
+                y = self._wrap(surf, self.check, x, y, w, col, 11.5) + t.u(6)
+        y += t.u(8)
+
+        # ---- run controls
+        if self.mode == "live":
+            if self.state == "running":
+                ui.button(surf, pygame.Rect(x, y, t.u(96), t.u(38)), "Stop", "stop", size=13.5)
+            else:
+                ui.button(surf, pygame.Rect(x, y, t.u(96), t.u(38)), "Start", "start", kind="primary", size=13.5)
+            ui.button(surf, pygame.Rect(x + t.u(102), y, t.u(84), t.u(38)), "Restart", "restart", size=12.5)
+            ui.button(surf, pygame.Rect(x + t.u(192), y, w - t.u(192), t.u(38)), "Next seed", "next", size=12.5)
+        else:
+            ui.button(surf, pygame.Rect(x, y, w, t.u(38)), "‹ Back to live", "exit_replay", size=13)
+        y += t.u(44)
+        if self.error:
+            y = self._wrap(surf, self.error, x, y, w, BAD, 11.5) + t.u(6)
+        t.text(surf, "Parameter changes restart the episode (same seed).", (x, y), FAINT, 10.5)
+        y += t.u(22)
+
+        # ---- parameters
+        section("PARAMETERS")
+        label("Difficulty preset")
+        chips([(p, p) for p in ("easy", "medium", "hard")], s.preset if s.base is None else None, "preset", 64)
+        t.text(surf, "Obstacles", (x, y + t.u(5)), MUTED, 12)
+        ui.stepper(surf, x + w - t.u(28 * 2 + 50 + 8), y, str(s.obstacles), "obstacles_step", w=50, h=26)
+        y += t.u(32)
+        chips([(n, str(n)) for n in (5, 10, 20, 40, 80)], s.obstacles, "obstacles", 36)
+        label("World speed  (world time vs real time)")
+        chips([(v, f"{v:g}×") for v in (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)], s.world_speed, "speed", 36)
+        label("Decision rate (max)")
+        chips([(v, f"{v:g}") for v in (2.0, 5.0, 10.0, 20.0, 60.0)], s.decision_hz, "hz", 40)
+        label("Requests in flight")
+        chips([(v, str(v)) for v in (1, 2, 3, 4)], s.max_inflight, "inflight", 40)
+        label("Added latency (simulated)")
+        chips([(v, f"{v:g}" if v else "0") for v in (0.0, 100.0, 200.0, 300.0, 500.0)], s.latency_ms, "latency", 40)
+        label("Episode length (world s)")
+        chips([(v, f"{v:g}") for v in (20.0, 60.0, 120.0)], s.max_duration, "duration", 44)
+        t.text(surf, "Seed", (x, y + t.u(5)), MUTED, 12)
+        ui.stepper(surf, x + w - t.u(28 * 2 + 50 + 8), y, str(self.seed), "seed", w=50, h=26)
+        y += t.u(36)
+        ui.toggle(surf, x, y, "save run logs", s.save_logs, "logs")
+        y += t.u(34)
+
+        # ---- recent runs
+        section("RECENT RUNS")
+        if not self.runs:
+            t.text(surf, "none yet", (x, y), FAINT, 11.5)
+            y += t.u(20)
+        for path, lab in self.runs:
+            r = pygame.Rect(x - t.u(6), y - t.u(3), w + t.u(12), t.u(22))
+            hover = r.collidepoint(ui.mouse) and sb.collidepoint(ui.mouse)
+            if hover:
+                pygame.draw.rect(surf, SURFACE_2, r, border_radius=t.u(4))
+            short = lab if len(lab) < 40 else lab[:38] + "…"
+            t.text(surf, short, (x, y), ACCENT if hover else MUTED, 11, mono=True)
+            if sb.colliderect(r):
+                ui.hits.append((r.clip(sb), "open_run", path, True))
+            y += t.u(22)
+        y += t.u(10)
+        t.text(surf, "keys: Space start/stop · R · N · -/= speed · J · G · P", (x, y), FAINT, 10.5)
+        y += t.u(24)
+        self.sidebar_content_h = y - y0 + t.u(16)
+        surf.set_clip(prev_clip)
+
+    def _wrap(self, surf, text, x, y, width, color, size) -> int:
+        t = self.app.t
+        line = ""
+        for word in str(text).split():
+            trial = (line + " " + word).strip()
+            if t.text_width(trial, size) > width and line:
+                t.text(surf, line, (x, y), color, size)
+                y += t.u(size + 5)
+                line = word
+            else:
+                line = trial
+        if line:
+            t.text(surf, line, (x, y), color, size)
+            y += t.u(size + 5)
+        return y
 
 
 # =================================================================== entry
-def run_app(settings: Optional[Settings] = None, start: str = "menu", replay_path=None, replay_at=None,
+def run_app(settings: Optional[Settings] = None, autostart: bool = False, replay_path=None, replay_at=None,
             panel: str = "decisions", max_frames: int = 0, screenshot: Optional[str] = None,
             window: Optional[tuple[int, int]] = None) -> int:
     app = App(Display(window))
     if settings is not None:
         app.settings = settings
-    if start == "play":
-        factory, err = app.settings.controller_factory()
-        scene = PlayScene(app, app.settings, factory, panel=panel) if factory else MenuScene(app, error=err)
-    elif start == "replay":
-        scene = ReplayScene(app, replay_path, start=replay_at, panel=panel)
-    else:
-        scene = MenuScene(app)
+    scene = ConsoleScene(app, autostart=autostart and replay_path is None, panel=panel)
+    if replay_path is not None:
+        scene.open_replay(replay_path)
+        if replay_at == "collision":
+            scene.jump_collision()
     app.run(scene, max_frames=max_frames, screenshot=screenshot)
     return 0
