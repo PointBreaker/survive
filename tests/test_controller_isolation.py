@@ -1,4 +1,5 @@
 import ast
+import re
 import gc
 from pathlib import Path
 
@@ -48,10 +49,12 @@ def test_wire_protocol_only_uses_public_interface():
 def test_controller_source_has_no_backdoor_names():
     for path in CONTROLLERS_DIR.glob("*.py"):
         src = path.read_text()
-        for bad in ("_rng", "Environment", "env.", "get_referrers", "__dict__"):
+        for bad in ("_rng", "Environment", "get_referrers", "__dict__"):
             if bad == "_rng" and path.name == "random.py":
                 continue  # the random controller's own RNG attribute
             assert bad not in src, f"{path.name} contains {bad!r}"
+        # attribute access on an `env` object (but not the ".env" file name)
+        assert not re.search(r"(?<![.\w])env\.", src), f"{path.name} accesses env."
 
 
 class Spy(SyncController):

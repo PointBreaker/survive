@@ -24,6 +24,10 @@ import remote.protocol as protocol
 
 class RemoteController(ThreadedController):
     name = "remote"
+    # Paths appended to the endpoint's own path. reset_path=None: stateless
+    # service, no reset call.
+    reset_path: Optional[str] = "/reset"
+    decide_path: str = "/decide"
 
     def __init__(
         self,
@@ -97,15 +101,17 @@ class RemoteController(ThreadedController):
     def reset(self, info: ArenaInfo) -> None:
         # Runs before the episode clock starts; failure here aborts the run.
         super().reset(info)
-        reply = self._post("/reset", self.encode_reset(info))
-        self.session = reply.get("session") if isinstance(reply, dict) else None
         self._request_id = 0
+        if self.reset_path is None:
+            return
+        reply = self._post(self.reset_path, self.encode_reset(info))
+        self.session = reply.get("session") if isinstance(reply, dict) else None
 
     def decide(self, observation: Observation) -> Decision:
         rid = self._request_id
         self._request_id += 1
         try:
-            payload = self._post("/decide", self.encode_decide(rid, observation))
+            payload = self._post(self.decide_path, self.encode_decide(rid, observation))
             action, meta = self.decode_decide(payload, rid)
         except (OSError, http.client.HTTPException, ValueError) as e:
             return Decision.failed(f"{type(e).__name__}: {e}")

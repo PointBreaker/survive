@@ -34,9 +34,13 @@ python -m arena.benchmark --controller simple_avoid --episodes 20 --adaptive wor
 
 python -m arena.replay runs/<run_dir>      # re-simulate a logged episode and verify it matches
 
-# out-of-process (Jev) path, validated against a local fake service
+# Jev via OpenRouter: cp .env.example .env, fill OPENROUTER_API_KEY, then
+python -m arena.jev_check
+python -m arena.benchmark --controller jev --episodes 10
+
+# out-of-process path validated against a local fake service
 python -m remote.fake_server --port 8765 --policy simple_avoid --latency-ms 150 &
-python -m arena.benchmark --controller jev --endpoint http://127.0.0.1:8765 --episodes 10
+python -m arena.benchmark --controller remote --endpoint http://127.0.0.1:8765 --episodes 10
 python -m benchmark.remote_validation --latencies 50,65,100,150,200 --episodes 10
 python -m pytest
 ```
@@ -62,11 +66,13 @@ arena/
   recorder.py             JSONL run logs      replay.py   deterministic re-simulation
   renderer.py             pygame drawing (visual only)
   benchmark.py            headless CLI (`python -m arena.benchmark`)
+  jev_check.py            Jev/OpenRouter connectivity check
+  dotenv.py               tiny .env loader (no dependency)
 controllers/
   base.py                 Controller protocol, SyncController, ThreadedController, LatencyWrapper
   human.py random.py greedy.py simple_avoid.py sleep.py
   remote.py               generic HTTP client for remote.protocol (worker thread, keep-alive)
-  jev.py                  JevController: RemoteController + JEV_ENDPOINT / JEV_API_KEY config
+  jev.py                  JevController: OpenRouter decisions API (typesafe/jev-1.13), token from .env
 remote/
   protocol.py             wire protocol decision-arena/v0 (JSON over HTTP)
   fake_server.py          local stand-in service: baseline policy + real latency/jitter/failures
@@ -134,26 +140,49 @@ mean/p50/p95 latency, world_speed_scale, decision_hz, obstacle_count, and
 per-tick `action_changes` for exact replay. There's no composite score.
 
 ### Out-of-process controllers (Jev)
-`JevController` sends the unified `ArenaInfo`/`Observation` as their unmodified
-`to_dict()` JSON (protocol `decision-arena/v0`, see `remote/protocol.py`):
 
-```
-POST /reset   {"protocol", "info"}                                  -> {"session"}
-POST /decide  {"protocol", "session", "request_id", "observation"}  -> {"request_id", "action", "meta"?}
+**Running Jev (TypeSafe Jev via OpenRouter):**
+
+```bash
+cp .env.example .env            # then put your token in: OPENROUTER_API_KEY=sk-or-...
+python -m arena.jev_check       # 3 real calls: latency, parsed action, raw reply
+python main.py --controller jev
+python -m arena.benchmark --controller jev --episodes 10
 ```
 
+`.env` is gitignored. Optional overrides go there too: `JEV_MODEL` (default
+`typesafe/jev-1.13`), `JEV_ENDPOINT` (default
+`https://openrouter.ai/api/alpha/decisions`), `JEV_TIMEOUT_S`.
+
+Each decision is one stateless POST in the decisions-API shape:
+
+```json
+{"model": "typesafe/jev-1.13",
+ "state": {"rules": <ArenaInfo.to_dict()>, "observation": <Observation.to_dict()>},
+ "questions": {"action": {"type": "choice", "instructions": "...", "criteria": {"STAY": "...", "N": "...", ...}}}}
+```
+
+* `state` holds exactly what every controller gets: the public rules and
+  the raw observation, unmodified. The instructions and criteria
+  (`controllers/jev.py`: `INSTRUCTIONS`, `ACTION_CRITERIA`) only explain the
+  rules and what each action does. A test makes sure they contain no strategy
+  words (safe, danger, avoid, nearest, recommend, ...).
+* The reply is searched for the answer to `action` under common layouts
+  (`{"action": ..}`, `{"answers": {"action": ..}}`, `{..: {"value": ..}}`, ...).
+  If none matches, the decision fails and the raw snippet goes into the
+  event log. `jev_check` prints the full raw reply, so a new format is easy
+  to adapt to.
 * The HTTP call runs on a worker thread, and the runner times the whole round
-  trip. Transport overhead is part of the controller's latency.
-* Any failure (HTTP error, timeout, bad JSON, unknown action, request_id
-  mismatch, service down) is a **failed decision**. It's logged, and the
-  previous action continues. The client never retries within a request and
-  never picks an action itself.
-* `meta` (e.g. the server's own `server_ms`) is logged for diagnosis and
-  never used for timing.
-* Config: `--endpoint` or `JEV_ENDPOINT`, `JEV_API_KEY` (bearer header,
-  never logged), `JEV_TIMEOUT_S`. If the real Jev API has a different format,
-  override `encode_reset` / `encode_decide` / `decode_decide`. They may change
-  the encoding, not the information content.
+  trip. Transport and network are part of the latency.
+* Any failure (HTTP error, timeout, bad JSON, unknown action, service down) is
+  a **failed decision**. It's logged, and the previous action continues. No
+  retry, no substitute action.
+
+**Local validation path:** `RemoteController` speaks a simple
+`/reset` + `/decide` protocol (`remote/protocol.py`) to
+`remote/fake_server.py`. The fake server runs a baseline policy in its own
+process with real injected latency. It uses the same HTTP client code as
+`JevController` and is used by `benchmark.remote_validation`.
 
 **Validation** (`benchmark.remote_validation`, SimpleAvoid served from a
 separate process vs. in-process simulated latency, 10 paired seeds, 20 s

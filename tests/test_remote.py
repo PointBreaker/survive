@@ -10,7 +10,6 @@ from arena.environment import Environment
 from arena.observation import ArenaInfo, Observation
 from arena.runner import TICK, EpisodeRunner
 from controllers.base import LatencyWrapper
-from controllers.jev import JevController
 from controllers.remote import RemoteController
 from controllers.simple_avoid import SimpleAvoidController
 from remote import protocol
@@ -46,7 +45,7 @@ def test_observation_and_info_roundtrip_through_json():
 def test_wire_payload_is_exactly_the_unified_observation(server_factory):
     srv = server_factory(policy="stay")
     env = Environment(cfg(), 1)
-    ctrl = JevController(endpoint=srv.url)
+    ctrl = RemoteController(endpoint=srv.url)
     runner = EpisodeRunner(env, ctrl)
     runner.start()
     obs_sent = []
@@ -67,7 +66,7 @@ def test_remote_policy_reproduces_in_process_policy_exactly(server_factory):
     """Same observations -> same policy -> same actions, across a process boundary."""
     srv = server_factory(policy="simple_avoid", latency_ms=100)
     c = cfg(max_duration=4.0)
-    remote = EpisodeRunner(Environment(c, 3), JevController(endpoint=srv.url)).run()
+    remote = EpisodeRunner(Environment(c, 3), RemoteController(endpoint=srv.url)).run()
     local = EpisodeRunner(Environment(c, 3), LatencyWrapper(SimpleAvoidController(), 100)).run()
     assert remote["action_changes"] == local["action_changes"]
     assert remote["ticks"] == local["ticks"] and remote["reason"] == local["reason"]
@@ -77,7 +76,7 @@ def test_remote_policy_reproduces_in_process_policy_exactly(server_factory):
 def test_slow_service_does_not_pause_world(server_factory):
     srv = server_factory(policy="greedy", latency_ms=300)
     env = Environment(cfg(obstacle_count=5, target_timeout=1e9), 0)
-    ctrl = JevController(endpoint=srv.url)
+    ctrl = RemoteController(endpoint=srv.url)
     runner = EpisodeRunner(env, ctrl)
     runner.start()
     x0 = [o.x for o in env.obstacles]
@@ -95,7 +94,7 @@ def test_slow_service_does_not_pause_world(server_factory):
 def test_injected_failures_keep_previous_action_without_fallback(server_factory):
     srv = server_factory(policy="greedy", fail_rate=1.0)
     env = Environment(cfg(obstacle_count=0), 0)
-    ctrl = JevController(endpoint=srv.url)
+    ctrl = RemoteController(endpoint=srv.url)
     result = EpisodeRunner(env, ctrl).run()
     ctrl.close()
     assert result["decision_count"] == 0
@@ -105,7 +104,7 @@ def test_injected_failures_keep_previous_action_without_fallback(server_factory)
 
 def test_invalid_action_is_a_failed_decision(server_factory):
     srv = server_factory(policy="greedy", invalid_rate=1.0)
-    ctrl = JevController(endpoint=srv.url)
+    ctrl = RemoteController(endpoint=srv.url)
     result = EpisodeRunner(Environment(cfg(), 0), ctrl).run()
     ctrl.close()
     assert result["decision_count"] == 0 and result["failed_decisions"] > 0
@@ -114,7 +113,7 @@ def test_invalid_action_is_a_failed_decision(server_factory):
 def test_service_dying_mid_episode_yields_failed_decisions(server_factory):
     srv = server_factory(policy="greedy")
     env = Environment(cfg(obstacle_count=0, target_timeout=1e9), 0)
-    ctrl = JevController(endpoint=srv.url, timeout_s=0.5)
+    ctrl = RemoteController(endpoint=srv.url, timeout_s=0.5)
     runner = EpisodeRunner(env, ctrl)
     runner.start()
     for _ in range(60):
@@ -138,15 +137,6 @@ def test_protocol_rejects_bad_replies():
     with pytest.raises(protocol.ProtocolError):
         protocol.parse_decide_response(["N"], 0)
     assert protocol.parse_decide_response({"action": "N", "request_id": 4}, 4)[0] is Action.N
-
-
-def test_jev_reads_endpoint_and_key_from_env(monkeypatch):
-    monkeypatch.setenv("JEV_ENDPOINT", "http://example.invalid:9999/jev")
-    monkeypatch.setenv("JEV_API_KEY", "secret")
-    c = JevController()
-    assert c.endpoint == "http://example.invalid:9999/jev"
-    assert c._headers["Authorization"] == "Bearer secret"
-    assert c._base_path == "/jev"
 
 
 def test_bad_endpoint_rejected():

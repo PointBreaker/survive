@@ -4,7 +4,8 @@ like simulated latency?
 For each latency level L:
   * remote:    start ``remote.fake_server`` as a separate OS process whose
                policy is SimpleAvoid and which holds each reply for L ms of
-               real wall time; run JevController against it.
+               real wall time; run RemoteController (same HTTP client code
+               JevController uses) against it.
   * simulated: run in-process SimpleAvoid behind LatencyWrapper(L), which
                charges L in physics ticks without sleeping.
 Both use the same seeds. Where the effective delay in ticks
@@ -33,7 +34,7 @@ from arena.recorder import new_run_dir
 from benchmark.metrics import aggregate
 from benchmark.runner import run_episodes
 from controllers.base import LatencyWrapper
-from controllers.jev import JevController
+from controllers.remote import RemoteController
 from controllers.simple_avoid import SimpleAvoidController
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,7 +59,7 @@ def compare_level(latency_ms: float, cfg, episodes: int, seed: int, jitter_ms: f
     proc, url = start_server(latency_ms, jitter_ms)
     try:
         t0 = time.perf_counter()
-        remote = run_episodes(lambda: JevController(endpoint=url), cfg, episodes, seed)
+        remote = run_episodes(lambda: RemoteController(endpoint=url), cfg, episodes, seed)
         remote_wall = time.perf_counter() - t0
     finally:
         proc.terminate()
@@ -131,7 +132,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nidentical episodes: {total}/{n}   mean transport overhead: {sum(ov) / len(ov):.2f} ms")
     print("(lat = measured mean latency; dly = mean effective delay in physics ticks)")
     if not args.no_save:
-        out = new_run_dir(args.out, "jev", "remote_validation")
+        out = new_run_dir(args.out, "remote", "validation")
         out.mkdir(parents=True, exist_ok=True)
         (out / "summary.json").write_text(json.dumps(
             {"config": cfg.to_dict(), "jitter_ms": args.jitter_ms, "levels": rows}, indent=2))

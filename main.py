@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import sys
 
+from arena.dotenv import load_dotenv
 from arena.cli import add_difficulty_args, config_from_args, controller_factory
 from arena.recorder import JsonlRecorder, NullRecorder, new_run_dir
 
@@ -29,6 +30,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--screenshot", default=None, help=argparse.SUPPRESS)
     add_difficulty_args(ap)
     args = ap.parse_args(argv)
+    load_dotenv()  # e.g. OPENROUTER_API_KEY for --controller jev
 
     # Humans need a responsive input loop; other controllers use the config default.
     human_hz = 60.0 if args.controller == "human" and args.decision_hz is None else None

@@ -20,6 +20,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from arena.dotenv import load_dotenv
 from arena.cli import add_difficulty_args, config_from_args, controller_factory
 from arena.recorder import new_run_dir
 from benchmark.adaptive import find_frontier
@@ -95,6 +96,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--quiet", action="store_true")
     add_difficulty_args(ap)
     args = ap.parse_args(argv)
+    load_dotenv()  # e.g. OPENROUTER_API_KEY for --controller jev
 
     base_cfg = config_from_args(args)
     out_dir = None if args.no_save else new_run_dir(args.out, args.controller, "bench")
