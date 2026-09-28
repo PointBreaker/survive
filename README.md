@@ -155,6 +155,24 @@ POST /decide  {"protocol", "session", "request_id", "observation"}  -> {"request
   override `encode_reset` / `encode_decide` / `decode_decide`. They may change
   the encoding, not the information content.
 
+**Validation** (`benchmark.remote_validation`, SimpleAvoid served from a
+separate process vs. in-process simulated latency, 10 paired seeds, 20 s
+episodes):
+
+| latency | remote success | sim success | remote / sim delay (ticks) | identical episodes |
+|---|---|---|---|---|
+| 50 ms | 1.00 | 1.00 | 4.00 / 4.00 | 10/10 |
+| 65 ms | 1.00 | 1.00 | 4.40 / 4.00 | 6/10 |
+| 100 ms | 0.90 | 0.90 | 7.00 / 7.00 | 10/10 |
+| 150 ms | 0.50 | 0.50 | 10.00 / 10.00 | 10/10 |
+| 200 ms | 0.10 | 0.10 | 13.05 / 13.00 | 8/10 |
+
+Transport overhead is about 1.9 ms on loopback. When the effective delay in
+ticks matches, the runs are bit-identical. The mismatches are expected:
+65 ms is just under a 4-tick boundary (66.7 ms), so real overhead pushes
+some decisions to 5 ticks. At 200 ms, occasional OS scheduling spikes
+(>16 ms) cost an extra tick. Real overhead is charged, as it should be.
+
 ## Baseline results (medium preset, 12 obstacles, 10 Hz, 1×)
 
 | controller | success (50 ep) | avg targets | avg survival |
