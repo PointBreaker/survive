@@ -2,48 +2,42 @@
 inspector's event-derived view model for drawing, and never feeds anything
 back to controllers.
 
-Layout::
+Everything is drawn directly at the display's pixel resolution (no surface
+rescaling), with antialiased shapes. Moving objects are interpolated between
+60 Hz physics ticks using their velocity, so motion stays smooth at any
+monitor refresh rate. That interpolation is visual only; the simulation is
+untouched.
 
-    +--------------------------------------------+------------------+
-    | HUD                                        |                  |
-    +--------------------------------------------+   inspector      |
-    | arena (scaled to fit the screen)           |   panel          |
-    |   ghost = snapshot the model is deciding on|                  |
-    +--------------------------------------------+                  |
-    | timeline (replay viewer only)              |                  |
-    +--------------------------------------------+------------------+
+Layout (recomputed every frame from the window size)::
+
+    +------------------------------------------+----------------+
+    | HUD (stats left, scene buttons right)    |                |
+    +------------------------------------------+   inspector    |
+    | arena (fit, centered)                    |   panel        |
+    +------------------------------------------+                |
+    | timeline                                 |                |
+    +------------------------------------------+----------------+
 """
 from __future__ import annotations
 
 import json
 import math
+from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
 import pygame
+import pygame.gfxdraw
 
 from arena.action import Action
 from arena.environment import Environment
-from arena.inspector import TICK_MS, DecisionRecord, Inspector
+from arena.inspector import TICK_MS, Inspector
+from arena.ui import (ACCENT, ACCENT_DIM, ARENA_BG, BAD, BG, BORDER, FAINT, GHOST, GRID, MUTED, OBSTACLE, OK,
+                      PLAYER, SURFACE, SURFACE_2, TARGET, TEXT, WARN, Theme)
 
-BG = (18, 20, 26)
-GRID = (28, 31, 40)
-PANEL_BG = (13, 14, 19)
-RULE = (40, 44, 56)
-PLAYER = (80, 200, 255)
-OBSTACLE = (235, 90, 80)
-TARGET = (120, 230, 120)
-GHOST = (150, 150, 190)
-TEXT = (220, 224, 232)
-DIM = (130, 136, 150)
-VEL = (255, 220, 90)
-OK = (120, 230, 120)
-BAD = (240, 95, 85)
-WARN = (245, 170, 70)
-ACCENT = (110, 170, 255)
-STATUS_COLOR = {"applied": TEXT, "failed": BAD, "dropped": WARN, "superseded": DIM}
-
+STATUS_COLOR = {"applied": TEXT, "failed": BAD, "dropped": WARN, "superseded": FAINT}
 COMPASS_ORDER = ("N", "NE", "E", "SE", "S", "SW", "W", "NW", "STAY")
 PANEL_MODES = ("decisions", "request", "response")
+VEL = (255, 214, 102)
 
 
 def _fmt_num(v: Any) -> Any:
@@ -92,62 +86,53 @@ def compact_json(obj: Any, indent: int = 0) -> list[str]:
     return [pad + json.dumps(_fmt_num(obj))]
 
 
+@dataclass
+class Layout:
+    W: int
+    H: int
+    hud: pygame.Rect
+    arena_area: pygame.Rect
+    arena: pygame.Rect  # exact world rectangle in pixels
+    scale: float  # pixels per world unit
+    timeline: pygame.Rect
+    panel: pygame.Rect
+    hud_controls_x: int  # scene buttons may use hud from here to the right
+    card: Optional[pygame.Rect] = None  # end-of-episode card (if drawn)
+    card_buttons_y: int = 0
+
+
 class Renderer:
-    HUD_H = 56
-    PANEL_W = 460
-    TIMELINE_H = 46
+    HUD_PT = 60
+    PANEL_PT = 440
+    TIMELINE_PT = 48
 
-    def __init__(
-        self,
-        width: float,
-        height: float,
-        title: str = "Decision Arena",
-        panel: bool = True,
-        timeline: bool = False,
-        scale: Optional[float] = None,
-    ):
-        pygame.init()
-        self.ww, self.wh = int(width), int(height)
-        self.panel = panel
-        self.timeline = timeline
-        panel_w = self.PANEL_W if panel else 0
-        tl_h = self.TIMELINE_H if timeline else 0
-        if scale is None:
-            info = pygame.display.Info()
-            sw, sh = info.current_w or 0, info.current_h or 0
-            scale = 1.0
-            if sw > 0 and sh > 0:
-                scale = min(1.0, (sw * 0.96 - panel_w) / self.ww, (sh * 0.88 - self.HUD_H - tl_h) / self.wh)
-            scale = max(0.4, scale)
-        self.scale = scale
-        self.aw, self.ah = int(self.ww * scale), int(self.wh * scale)
-        self.W = self.aw + panel_w
-        self.H = max(self.HUD_H + self.ah + tl_h, 700 if panel else 0)
-        self.screen = pygame.display.set_mode((self.W, self.H))
-        pygame.display.set_caption(title)
-        self.world = pygame.Surface((self.ww, self.wh))
-        self.f_small = pygame.font.SysFont("monospace", 13)
-        self.f = pygame.font.SysFont("monospace", 15)
-        self.f_bold = pygame.font.SysFont("monospace", 15, bold=True)
-        self.f_big = pygame.font.SysFont("monospace", 30, bold=True)
-        self.f_huge = pygame.font.SysFont("monospace", 34, bold=True)
-        self._grid = self._make_grid()
-        self.timeline_rect = pygame.Rect(0, self.HUD_H + self.ah, self.aw, tl_h)
+    def __init__(self, display, show_panel: bool = True, show_timeline: bool = True):
+        self.display = display
+        self.show_panel = show_panel
+        self.show_timeline = show_timeline
+        self.t = Theme(display.density)
+        self._grid_cache: tuple[tuple, Optional[pygame.Surface]] = ((), None)
+        self.timeline_reserve = 0
+        self.timeline_pt = self.TIMELINE_PT  # scenes may make it taller to host controls above the track
 
-    def _make_grid(self) -> pygame.Surface:
-        s = pygame.Surface((self.ww, self.wh))
-        s.fill(BG)
-        for x in range(0, self.ww, 50):
-            pygame.draw.line(s, GRID, (x, 0), (x, self.wh))
-        for y in range(0, self.wh, 50):
-            pygame.draw.line(s, GRID, (0, y), (self.ww, y))
-        return s
-
-    def _text(self, surf, s: str, pos, color=TEXT, font=None) -> int:
-        font = font or self.f
-        img = font.render(s, True, color)
-        surf.blit(img, pos)
-        return img.get_height()
+    # ================================================================ layout
+    def layout(self, world_w: float, world_h: float) -> Layout:
+        t = self.t
+        if t.d != self.display.density:
+            self.t = t = Theme(self.display.density)
+        W, H = self.display.size
+        panel_w = t.u(self.PANEL_PT) if self.show_panel else 0
+        panel_w = min(panel_w, W // 2)
+        hud = pygame.Rect(0, 0, W - panel_w, t.u(self.HUD_PT))
+        tl_h = t.u(self.timeline_pt) if self.show_timeline else 0
+        area = pygame.Rect(0, hud.bottom, W - panel_w, H - hud.bottom - tl_h)
+        m = t.u(10)
+        s = max(0.05, min((area.w - 2 * m) / world_w, (area.h - 2 * m) / world_h))
+        aw, ah = int(world_w * s), int(world_h * s)
+        arena = pygame.Rect(area.x + (area.w - aw) // 2, area.y + (area.h - ah) // 2, aw, ah)
+        timeline = pygame.Rect(0, area.bottom, W - panel_w, tl_h)
+        panel = pygame.Rect(W - panel_w, 0, panel_w, H)
+        return Layout(W, H, hud, area, arena, s, timeline, panel, hud_controls_x=int(hud.w * 0.52))
 
     # ================================================================= frame
     def draw(
@@ -156,6 +141,8 @@ class Renderer:
         controller_name: str,
         action: str,
         latency_ms: Optional[float],
+        *,
+        alpha: float = 0.0,
         debug: bool = False,
         inspector: Optional[Inspector] = None,
         ghost: bool = True,
@@ -164,314 +151,406 @@ class Renderer:
         header: Sequence[str] = (),
         raw_request: Any = None,
         raw_response: Any = None,
-        status: str = "",
         timeline: Optional[dict[str, Any]] = None,
-    ) -> None:
-        scr = self.screen
-        scr.fill(PANEL_BG)
-        self._draw_world(env, action, debug, inspector if ghost else None,
+        fps: Optional[float] = None,
+        card_lines: Optional[Sequence[str]] = None,
+        hud_reserve: int = 0,
+        timeline_reserve: int = 0,
+    ) -> Layout:
+        surf = self.display.surface
+        cfg = env.config
+        L = self.layout(cfg.arena_width, cfg.arena_height)
+        surf.fill(BG)
+        self._draw_world(surf, L, env, action, alpha, debug, inspector if ghost else None,
                          inspector.last_applied() if (inspector and compass) else None)
-        if self.scale != 1.0:
-            scr.blit(pygame.transform.smoothscale(self.world, (self.aw, self.ah)), (0, self.HUD_H))
-        else:
-            scr.blit(self.world, (0, self.HUD_H))
-        self._draw_hud(env, controller_name, action, latency_ms, debug, status)
-        if self.timeline and timeline:
-            self._draw_timeline(timeline)
-        if self.panel:
-            self._draw_panel(env, inspector, panel_mode, header, raw_request, raw_response)
-        pygame.display.flip()
+        self.timeline_reserve = timeline_reserve
+        self._draw_hud(surf, L, env, controller_name, action, latency_ms, fps, hud_reserve)
+        if self.show_timeline and timeline:
+            self._draw_timeline(surf, L, timeline)
+        if self.show_panel and L.panel.w > 0:
+            self._draw_panel(surf, L, env, inspector, panel_mode, header, raw_request, raw_response)
+        if env.done and card_lines is not None:
+            self._draw_card(surf, L, env, card_lines)
+        return L
 
     # ================================================================= arena
-    def _draw_world(self, env, action, debug, inspector, last_applied) -> None:
-        w = self.world
-        w.blit(self._grid, (0, 0))
-        t = env.target
-        pygame.draw.circle(w, TARGET, (int(t.x), int(t.y)), int(t.radius))
-        pygame.draw.circle(w, BG, (int(t.x), int(t.y)), max(1, int(t.radius * 0.45)))
+    def _grid(self, L: Layout, world_w: float, world_h: float) -> pygame.Surface:
+        key = (L.arena.size, L.scale)
+        if self._grid_cache[0] != key:
+            # Opaque source: blitting it is a plain copy, no per-pixel blending.
+            g = pygame.Surface(L.arena.size, 0, 32)
+            g.fill(ARENA_BG)
+            step = 50
+            for i in range(0, int(world_w) + 1, step):
+                x = int(i * L.scale)
+                pygame.draw.line(g, GRID, (x, 0), (x, L.arena.h))
+            for i in range(0, int(world_h) + 1, step):
+                y = int(i * L.scale)
+                pygame.draw.line(g, GRID, (0, y), (L.arena.w, y))
+            self._grid_cache = (key, g)
+        return self._grid_cache[1]
+
+    @staticmethod
+    def _disc(surf, color, c, r) -> None:
+        r = max(1, int(r))
+        pygame.gfxdraw.filled_circle(surf, c[0], c[1], r, color)
+        pygame.gfxdraw.aacircle(surf, c[0], c[1], r, color)
+
+    @staticmethod
+    def _ring(surf, color, c, r) -> None:
+        pygame.gfxdraw.aacircle(surf, c[0], c[1], max(1, int(r)), color)
+
+    def _draw_world(self, surf, L: Layout, env, action, alpha, debug, inspector, last_applied) -> None:
+        t, cfg = self.t, env.config
+        s, ax, ay = L.scale, L.arena.x, L.arena.y
+        surf.blit(self._grid(L, cfg.arena_width, cfg.arena_height), L.arena.topleft)
+        pygame.draw.rect(surf, BORDER, L.arena, width=max(1, t.u(1)))
+        prev_clip = surf.get_clip()
+        surf.set_clip(L.arena)
+        # Visual interpolation within the current physics tick.
+        lead = 0.0 if env.done else alpha * cfg.world_speed_scale / 60.0
+
+        def P(x, y, vx=0.0, vy=0.0):
+            return int(ax + (x + vx * lead) * s), int(ay + (y + vy * lead) * s)
+
+        tg = env.target
+        tc = P(tg.x, tg.y)
+        self._disc(surf, TARGET, tc, tg.radius * s)
+        self._disc(surf, ARENA_BG, tc, tg.radius * s * 0.45)
 
         p = env.player
-        # Ghost: the snapshot the controller is currently deciding on.
+        pc = P(p.x, p.y, p.vx, p.vy)
+        # Ghost: the (oldest) snapshot the controller is currently deciding on.
         req = inspector.inflight() if inspector else None
-        if req and req.get("observation"):
+        if req and req.get("observation") and (env.tick - req["tick"]) * TICK_MS >= 50:
             obs = req["observation"]
             for o in obs["obstacles"]:
-                pygame.draw.circle(w, GHOST, (int(o["x"]), int(o["y"])), int(o["radius"]), 1)
+                self._ring(surf, GHOST, P(o["x"], o["y"]), o["radius"] * s)
             gp = obs["player"]
-            pygame.draw.circle(w, GHOST, (int(gp["x"]), int(gp["y"])), int(gp["radius"]), 2)
-            pygame.draw.line(w, GHOST, (int(gp["x"]), int(gp["y"])), (int(p.x), int(p.y)), 1)
+            gc = P(gp["x"], gp["y"])
+            self._ring(surf, GHOST, gc, gp["radius"] * s)
+            pygame.draw.aaline(surf, GHOST, gc, pc)
             age = (env.tick - req["tick"]) * TICK_MS
-            self._text(w, f"snapshot -{age:.0f}ms", (int(gp["x"]) + 14, int(gp["y"]) - 22), GHOST, self.f_small)
+            t.text(surf, f"snapshot −{age:.0f} ms", (gc[0] + t.u(12), gc[1] - t.u(20)), GHOST, 10.5)
 
         for o in env.obstacles:
-            c = (int(o.x), int(o.y))
-            pygame.draw.circle(w, OBSTACLE, c, int(o.radius))
+            c = P(o.x, o.y, o.vx, o.vy)
+            self._disc(surf, OBSTACLE, c, o.radius * s)
             if debug:
-                pygame.draw.line(w, VEL, c, (int(o.x + o.vx * 0.5), int(o.y + o.vy * 0.5)), 1)
-                img = self.f_small.render(str(o.id), True, TEXT)
-                w.blit(img, img.get_rect(center=c))
+                pygame.draw.aaline(surf, VEL, c, (c[0] + int(o.vx * 0.5 * s), c[1] + int(o.vy * 0.5 * s)))
+                t.text(surf, str(o.id), c, (20, 20, 24), 10, bold=True, anchor="center")
 
-        pc = (int(p.x), int(p.y))
         # Probability compass of the decision currently in force.
         probs = (last_applied.meta or {}).get("probabilities") if last_applied else None
         if isinstance(probs, dict):
             for name, prob in probs.items():
                 if name in Action.__members__ and name != "STAY" and isinstance(prob, (int, float)):
                     dx, dy = Action(name).direction
-                    L = 18 + 70 * float(prob)
-                    col = ACCENT if name == last_applied.action else (70, 90, 130)
-                    pygame.draw.line(w, col, pc, (int(p.x + dx * L), int(p.y + dy * L)), 3)
+                    Lg = (p.radius + 6 + 70 * float(prob)) * s
+                    col = ACCENT if name == last_applied.action else ACCENT_DIM
+                    pygame.draw.line(surf, col, pc, (int(pc[0] + dx * Lg), int(pc[1] + dy * Lg)), max(2, t.u(3)))
             stay = probs.get("STAY")
             if isinstance(stay, (int, float)) and stay > 0.02:
-                pygame.draw.circle(w, (70, 90, 130), pc, int(p.radius + 4 + 20 * stay), 2)
+                self._ring(surf, ACCENT_DIM, pc, (p.radius + 4 + 20 * stay) * s)
 
-        pygame.draw.circle(w, PLAYER, pc, int(p.radius))
+        self._disc(surf, PLAYER, pc, p.radius * s)
         if action and action != "STAY":
             dx, dy = Action(action).direction
-            tip = (p.x + dx * (p.radius + 16), p.y + dy * (p.radius + 16))
-            pygame.draw.line(w, TEXT, pc, (int(tip[0]), int(tip[1])), 2)
+            r0 = (p.radius + 4) * s
+            r1 = (p.radius + 20) * s
+            a = (int(pc[0] + dx * r0), int(pc[1] + dy * r0))
+            b = (int(pc[0] + dx * r1), int(pc[1] + dy * r1))
+            pygame.draw.line(surf, TEXT, a, b, max(2, t.u(2)))
             ang = math.atan2(dy, dx)
-            for s in (-0.5, 0.5):
-                pygame.draw.line(w, TEXT, (int(tip[0]), int(tip[1])),
-                                 (int(tip[0] - 7 * math.cos(ang + s)), int(tip[1] - 7 * math.sin(ang + s))), 2)
+            h = t.u(7)
+            for sgn in (-0.55, 0.55):
+                pygame.draw.line(surf, TEXT, b, (int(b[0] - h * math.cos(ang + sgn)),
+                                                 int(b[1] - h * math.sin(ang + sgn))), max(2, t.u(2)))
         if debug:
-            pygame.draw.line(w, VEL, pc, (int(p.x + p.vx * 0.5), int(p.y + p.vy * 0.5)), 2)
+            pygame.draw.aaline(surf, VEL, pc, (pc[0] + int(p.vx * 0.5 * s), pc[1] + int(p.vy * 0.5 * s)))
+        surf.set_clip(prev_clip)
 
-        if env.done:
-            o = env.outcome
-            msg = "SURVIVED" if o.success else f"FAILED: {o.reason}"
-            img = self.f_huge.render(msg, True, OK if o.success else BAD)
-            w.blit(img, img.get_rect(center=(self.ww // 2, self.wh // 2 - 20)))
-
-    def _draw_hud(self, env, controller_name, action, latency_ms, debug, status) -> None:
-        scr = self.screen
-        cfg = env.config
-        pygame.draw.rect(scr, (10, 11, 15), (0, 0, self.aw, self.HUD_H))
-        lat = "-" if latency_ms is None else f"{latency_ms:.0f}ms"
+    # =================================================================== HUD
+    def _draw_hud(self, surf, L: Layout, env, controller_name, action, latency_ms, fps, reserve=0) -> None:
+        t, cfg = self.t, env.config
+        pygame.draw.rect(surf, SURFACE, L.hud)
+        pygame.draw.line(surf, BORDER, L.hud.bottomleft, L.hud.bottomright, max(1, t.u(1)))
+        prev_clip = surf.get_clip()
+        surf.set_clip(pygame.Rect(0, 0, max(0, L.hud.w - reserve - t.u(12)), L.hud.h))
+        x, y = t.u(16), t.u(9)
+        r = t.text(surf, controller_name, (x, y), TEXT, 16, bold=True)
         since = env.world_time - env.last_target_time
-        l1 = (f"{controller_name}  score {env.score}  t {env.world_time:5.2f}s  "
-              f"world {cfg.world_speed_scale:g}x  obst {len(env.obstacles)}  {cfg.decision_hz:g}Hz")
-        l2 = (f"action {action:<4} latency {lat:<6} seed {env.seed}  timer {since:4.1f}/{cfg.target_timeout:g}s"
-              + ("  [debug]" if debug else ""))
-        self._text(scr, l1, (10, 8))
-        self._text(scr, l2, (10, 30), DIM)
-        if status:  # overlay in the arena's top-right corner, never over HUD text
-            img = self.f_bold.render(status, True, WARN)
-            box = img.get_rect(topright=(self.aw - 8, self.HUD_H + 8)).inflate(12, 6)
-            pygame.draw.rect(scr, (10, 11, 15), box)
-            scr.blit(img, img.get_rect(center=box.center))
+        timer_col = WARN if since > cfg.target_timeout * 0.7 else MUTED
+        t.text(surf, f"score {env.score}", (r.right + t.u(16), y + t.u(2)), OK, 14, bold=True)
+        tx = r.right + t.u(16) + t.text_width(f"score {env.score}", 14, bold=True) + t.u(14)
+        t.text(surf, f"{env.world_time:5.1f} s", (tx, y + t.u(2)), TEXT, 14, mono=True)
+        t.text(surf, f"target timer {since:4.1f}/{cfg.target_timeout:g}s",
+               (tx + t.text_width("000.0 s", 14, mono=True) + t.u(14), y + t.u(3)), timer_col, 12.5)
+        lat = "–" if latency_ms is None else f"{latency_ms:.0f} ms"
+        parts = [f"world {cfg.world_speed_scale:g}×", f"{len(env.obstacles)} obstacles", f"{cfg.decision_hz:g} Hz",
+                 f"{cfg.max_inflight} in flight", f"action {action}", f"latency {lat}", f"seed {env.seed}"]
+        if fps is not None:
+            parts.append(f"{fps:.0f} fps")
+        t.text(surf, "   ".join(parts), (x, y + t.u(26)), MUTED, 12)
+        surf.set_clip(prev_clip)
 
     # ============================================================== timeline
-    def _draw_timeline(self, tl: dict[str, Any]) -> None:
-        scr = self.screen
-        r = self.timeline_rect
-        pygame.draw.rect(scr, (10, 11, 15), r)
+    def _draw_timeline(self, surf, L: Layout, tl: dict[str, Any]) -> None:
+        t = self.t
+        r = L.timeline
+        pygame.draw.rect(surf, SURFACE, r)
+        pygame.draw.line(surf, BORDER, r.topleft, r.topright, max(1, t.u(1)))
         total = max(1, tl["total_ticks"])
-        x0, x1 = r.x + 10, r.right - 10
+        x0, x1 = r.x + t.u(16) + self.timeline_reserve, r.right - t.u(16)
 
         def X(tick):
             return int(x0 + (x1 - x0) * min(max(tick, 0), total) / total)
 
-        y = r.y + 8
-        pygame.draw.line(scr, RULE, (x0, y + 14), (x1, y + 14), 1)
-        for t in tl.get("requests", ()):
-            pygame.draw.line(scr, (70, 76, 92), (X(t), y + 10), (X(t), y + 18))
-        for t in tl.get("applied", ()):
-            pygame.draw.line(scr, ACCENT, (X(t), y + 4), (X(t), y + 12))
-        for t in tl.get("failed", ()):
-            pygame.draw.line(scr, BAD, (X(t), y + 2), (X(t), y + 24), 2)
-        for t in tl.get("targets", ()):
-            pygame.draw.circle(scr, OK, (X(t), y + 22), 3)
+        top = r.bottom - t.u(self.TIMELINE_PT)
+        yb = top + t.u(16)
+        pygame.draw.line(surf, BORDER, (x0, yb), (x1, yb), max(1, t.u(2)))
+        for tk in tl.get("requests", ()):
+            pygame.draw.line(surf, FAINT, (X(tk), yb - t.u(3)), (X(tk), yb + t.u(3)))
+        for tk in tl.get("applied", ()):
+            pygame.draw.line(surf, ACCENT, (X(tk), yb - t.u(9)), (X(tk), yb - t.u(3)))
+        for tk in tl.get("failed", ()):
+            pygame.draw.line(surf, BAD, (X(tk), yb - t.u(10)), (X(tk), yb + t.u(10)), max(1, t.u(2)))
+        for tk in tl.get("targets", ()):
+            self._disc(surf, OK, (X(tk), yb + t.u(7)), t.u(3))
         ct = tl.get("collision_tick")
         if ct is not None:
-            cx = X(ct)
-            pygame.draw.line(scr, BAD, (cx - 5, y + 9), (cx + 5, y + 19), 2)
-            pygame.draw.line(scr, BAD, (cx - 5, y + 19), (cx + 5, y + 9), 2)
+            cx, h = X(ct), t.u(5)
+            pygame.draw.line(surf, BAD, (cx - h, yb - h), (cx + h, yb + h), max(2, t.u(2)))
+            pygame.draw.line(surf, BAD, (cx - h, yb + h), (cx + h, yb - h), max(2, t.u(2)))
         cx = X(tl["current"])
-        pygame.draw.line(scr, TEXT, (cx, r.y + 2), (cx, r.bottom - 12), 2)
-        self._text(scr, tl.get("label", ""), (x0, r.bottom - 16), DIM, self.f_small)
+        pygame.draw.line(surf, TEXT, (cx, top + t.u(4)), (cx, yb + t.u(10)), max(2, t.u(2)))
+        prev = surf.get_clip()
+        surf.set_clip(pygame.Rect(x0, r.y, x1 - x0, r.h))
+        t.text(surf, tl.get("label", ""), (x0, r.bottom - t.u(6)), MUTED, 11, anchor="bottomleft")
+        surf.set_clip(prev)
 
-    def timeline_tick_at(self, x: int, total_ticks: int) -> int:
-        r = self.timeline_rect
-        x0, x1 = r.x + 10, r.right - 10
+    def timeline_tick_at(self, L: Layout, x: int, total_ticks: int) -> int:
+        r = L.timeline
+        x0, x1 = r.x + self.t.u(16) + self.timeline_reserve, r.right - self.t.u(16)
         return int(round((min(max(x, x0), x1) - x0) / max(1, x1 - x0) * total_ticks))
 
+    # ================================================================== card
+    def _draw_card(self, surf, L: Layout, env, lines: Sequence[str]) -> None:
+        t = self.t
+        o = env.outcome
+        w, h = t.u(420), t.u(118 + 20 * len(lines) + 56)
+        card = pygame.Rect(0, 0, w, h)
+        card.center = L.arena.center
+        shade = pygame.Surface(L.arena.size, pygame.SRCALPHA)
+        shade.fill((0, 0, 0, 110))
+        surf.blit(shade, L.arena.topleft)
+        pygame.draw.rect(surf, SURFACE, card, border_radius=t.u(12))
+        pygame.draw.rect(surf, BORDER, card, width=max(1, t.u(1)), border_radius=t.u(12))
+        title = "Survived" if o.success else {"collision": "Collision", "target_timeout": "Target timeout"}.get(
+            o.reason, str(o.reason))
+        t.text(surf, title, (card.centerx, card.y + t.u(22)), OK if o.success else BAD, 26, bold=True,
+               anchor="midtop")
+        y = card.y + t.u(70)
+        for line in lines:
+            t.text(surf, line, (card.centerx, y), MUTED, 13, anchor="midtop")
+            y += t.u(20)
+        L.card = card
+        L.card_buttons_y = card.bottom - t.u(52)
+
     # ================================================================= panel
-    def _draw_panel(self, env, ins: Optional[Inspector], mode, header, raw_request, raw_response) -> None:
-        scr = self.screen
-        x0 = self.aw
-        pygame.draw.rect(scr, PANEL_BG, (x0, 0, self.PANEL_W, self.H))
-        pygame.draw.line(scr, RULE, (x0, 0), (x0, self.H))
-        x = x0 + 14
-        y = 10
-        tabs = "  ".join(f"[{m}]" if m == mode else m for m in PANEL_MODES)
-        y += self._text(scr, f"INSPECTOR  {tabs}", (x, y), ACCENT, self.f_bold) + 2
+    def _draw_panel(self, surf, L: Layout, env, ins: Optional[Inspector], mode, header, raw_request,
+                    raw_response) -> None:
+        t = self.t
+        P = L.panel
+        pygame.draw.rect(surf, SURFACE, P)
+        pygame.draw.line(surf, BORDER, P.topleft, P.bottomleft, max(1, t.u(1)))
+        x = P.x + t.u(18)
+        w = P.w - t.u(36)
+        y = t.u(14)
+        t.text(surf, "Inspector", (x, y), TEXT, 16, bold=True)
+        tx = x + t.text_width("Inspector", 16, bold=True) + t.u(14)
+        for m in PANEL_MODES:
+            col = ACCENT if m == mode else FAINT
+            r = t.text(surf, m, (tx, y + t.u(3)), col, 12.5, bold=m == mode)
+            if m == mode:
+                pygame.draw.line(surf, ACCENT, (r.x, r.bottom + t.u(2)), (r.right, r.bottom + t.u(2)), t.u(2))
+            tx = r.right + t.u(12)
+        y += t.u(26)
         for h in header:
-            y += self._text(scr, h, (x, y), DIM, self.f_small)
-        y += 6
+            t.text(surf, h, (x, y), MUTED, 11.5, mono=True)
+            y += t.u(16)
+        y += t.u(6)
         if ins is None:
-            self._text(scr, "(no inspector)", (x, y), DIM)
+            t.text(surf, "(no inspector)", (x, y), FAINT)
             return
-        y = self._section_inflight(env, ins, x, y)
+        y = self._section_inflight(surf, env, ins, x, y, w)
+        bottom = P.bottom - t.u(30)
         if mode == "decisions":
-            y = self._section_decision(ins, x, y)
-            y = self._section_stats(env, ins, x, y)
-            self._section_recent(ins, x, y)
+            y = self._section_decision(surf, ins, x, y, w)
+            y = self._section_stats(surf, env, ins, x, y, w)
+            self._section_recent(surf, ins, x, y, bottom)
         else:
             payload = raw_request if mode == "request" else raw_response
             title = "last request body" if mode == "request" else "last response"
-            self._section_json(title, payload, x, y)
-        self._text(scr, "J panel  G ghost  P compass  F1 debug", (x, self.H - 20), DIM, self.f_small)
+            self._section_json(surf, title, payload, x, y, w, bottom)
+        t.text(surf, "J panel   G ghost   P compass   F1 debug", (x, P.bottom - t.u(10)), FAINT, 11,
+               anchor="bottomleft")
 
-    def _rule(self, x, y) -> int:
-        pygame.draw.line(self.screen, RULE, (x, y), (x + self.PANEL_W - 28, y))
-        return y + 8
+    def _rule(self, surf, x, y, w) -> int:
+        pygame.draw.line(surf, BORDER, (x, y), (x + w, y), max(1, self.t.u(1)))
+        return y + self.t.u(10)
 
-    def _section_inflight(self, env, ins: Inspector, x, y) -> int:
-        scr = self.screen
-        y = self._rule(x, y)
+    def _bar(self, surf, x, y, w, h, frac, color) -> None:
+        t = self.t
+        pygame.draw.rect(surf, SURFACE_2, (x, y, w, h), border_radius=t.u(3))
+        if frac > 0:
+            pygame.draw.rect(surf, color, (x, y, max(t.u(2), int(w * min(1.0, frac))), h), border_radius=t.u(3))
+
+    def _section_inflight(self, surf, env, ins: Inspector, x, y, w) -> int:
+        t = self.t
+        y = self._rule(surf, x, y, w)
         reqs = ins.inflight_all()
         period_ms = 1000.0 / env.config.decision_hz
         cap = env.config.max_inflight
         if reqs:
-            self._text(scr, f"IN FLIGHT  {len(reqs)}/{cap}", (x, y), WARN, self.f_bold)
-            y += 20
+            t.text(surf, f"In flight  {len(reqs)}/{cap}", (x, y), WARN, 13, bold=True)
+            y += t.u(22)
             waits = [(r, (env.tick - r["tick"]) * TICK_MS) for r in reqs]
-            scale_ms = max(500.0, max(w for _, w in waits) * 1.1)
-            bw = self.PANEL_W - 28 - 120
+            scale_ms = max(500.0, max(wt for _, wt in waits) * 1.1)
+            bw = w - t.u(120)
             for r, waited in waits[:5]:
-                self._text(scr, f"#{r['id']:<4}", (x, y - 2), TEXT, self.f_small)
-                bx = x + 50
-                pygame.draw.rect(scr, (30, 32, 40), (bx, y, bw, 9))
-                pygame.draw.rect(scr, WARN, (bx, y, int(bw * min(1, waited / scale_ms)), 9))
+                t.text(surf, f"#{r['id']}", (x, y - t.u(1)), MUTED, 11.5, mono=True)
+                bx = x + t.u(52)
+                self._bar(surf, bx, y + t.u(2), bw, t.u(9), waited / scale_ms, WARN)
                 px = bx + int(bw * period_ms / scale_ms)
-                pygame.draw.line(scr, TEXT, (px, y - 2), (px, y + 11), 1)
-                self._text(scr, f"{waited:5.0f} ms", (bx + bw + 8, y - 2), WARN, self.f_small)
-                y += 14
-            self._text(scr, f"ghost = oldest (#{reqs[0]['id']})   | = period {period_ms:.0f}ms",
-                       (x, y), DIM, self.f_small)
-            y += 16
+                pygame.draw.line(surf, TEXT, (px, y - t.u(1)), (px, y + t.u(13)), max(1, t.u(1)))
+                t.text(surf, f"{waited:4.0f} ms", (x + w, y - t.u(1)), WARN, 11.5, mono=True, anchor="topright")
+                y += t.u(17)
+            t.text(surf, f"ghost = oldest snapshot   │ = decision period {period_ms:.0f} ms", (x, y), FAINT, 11)
+            y += t.u(18)
         else:
-            self._text(scr, f"idle  (0/{cap} requests in flight)", (x, y), DIM, self.f_bold)
-            y += 22
-        return y + 4
+            t.text(surf, f"Idle   0/{cap} requests in flight", (x, y), FAINT, 13, bold=True)
+            y += t.u(24)
+        return y + t.u(4)
 
-    def _section_decision(self, ins: Inspector, x, y) -> int:
-        scr = self.screen
-        y = self._rule(x, y)
+    def _section_decision(self, surf, ins: Inspector, x, y, w) -> int:
+        t = self.t
+        y = self._rule(surf, x, y, w)
         last = ins.records[-1] if ins.records else None
         if last is None:
-            self._text(scr, "no decision yet", (x, y), DIM)
-            return y + 24
-        color = STATUS_COLOR[last.status]
-        self._text(scr, f"LAST RESPONSE  #{last.id}  {last.status}", (x, y), DIM, self.f_bold)
-        y += 20
-        label = last.action or "—"
-        self._text(scr, label, (x, y), color, self.f_big)
+            t.text(surf, "No response yet", (x, y), FAINT, 13)
+            return y + t.u(26)
+        t.text(surf, f"Last response  #{last.id}", (x, y), MUTED, 12.5, bold=True)
+        t.text(surf, last.status, (x + w, y), STATUS_COLOR[last.status], 12.5, bold=True, anchor="topright")
+        y += t.u(22)
+        t.text(surf, last.action or "—", (x, y), STATUS_COLOR[last.status], 30, bold=True)
+        right = x + t.u(96)
         meta = last.meta or {}
+        t.text(surf, f"latency {last.latency_ms:.0f} ms", (right, y + t.u(1)), TEXT, 13)
+        t.text(surf, f"took effect {last.delay_ticks} ticks ({last.delay_ticks * TICK_MS:.0f} ms) after snapshot",
+               (right, y + t.u(19)), MUTED, 11)
         conf = meta.get("confidence")
-        right = x + 110
-        self._text(scr, f"latency {last.latency_ms:6.0f} ms", (right, y), TEXT)
-        self._text(scr, f"applied +{last.delay_ticks} ticks ({last.delay_ticks * TICK_MS:.0f}ms after snapshot)",
-                   (right, y + 17), DIM, self.f_small)
         if isinstance(conf, (int, float)):
-            self._text(scr, f"confidence {conf:.2f}", (right, y + 31), ACCENT, self.f_small)
-        y += 50
+            t.text(surf, f"confidence {conf:.2f}", (right, y + t.u(34)), ACCENT, 11.5, bold=True)
+        y += t.u(54)
         if last.error:
-            for i in range(0, min(len(last.error), 180), 58):
-                y += self._text(scr, last.error[i:i + 58], (x, y), BAD, self.f_small)
-            y += 4
+            for i in range(0, min(len(last.error), 200), 56):
+                t.text(surf, last.error[i:i + 56], (x, y), BAD, 11, mono=True)
+                y += t.u(15)
+            y += t.u(4)
         probs = meta.get("probabilities")
         if isinstance(probs, dict) and probs:
-            bw = self.PANEL_W - 130
+            bw = w - t.u(90)
             for name in COMPASS_ORDER:
                 pv = probs.get(name)
                 if not isinstance(pv, (int, float)):
                     continue
                 chosen = name == last.action
-                self._text(scr, f"{name:>4}", (x, y), TEXT if chosen else DIM, self.f_small)
-                pygame.draw.rect(scr, (30, 32, 40), (x + 44, y + 3, bw, 9))
-                pygame.draw.rect(scr, ACCENT if chosen else (70, 90, 130), (x + 44, y + 3, int(bw * pv), 9))
-                self._text(scr, f"{pv:.2f}", (x + 50 + bw, y), TEXT if chosen else DIM, self.f_small)
-                y += 15
+                t.text(surf, name, (x + t.u(34), y), TEXT if chosen else MUTED, 11.5, bold=chosen, anchor="topright")
+                self._bar(surf, x + t.u(42), y + t.u(3), bw, t.u(9), pv, ACCENT if chosen else ACCENT_DIM)
+                t.text(surf, f"{pv:.2f}", (x + w, y), TEXT if chosen else MUTED, 11.5, mono=True, anchor="topright")
+                y += t.u(16)
         elif last.status == "applied":
-            self._text(scr, "(controller reports no probabilities)", (x, y), DIM, self.f_small)
-            y += 16
-        return y + 6
+            t.text(surf, "controller reports no probabilities", (x, y), FAINT, 11)
+            y += t.u(16)
+        return y + t.u(6)
 
-    def _section_stats(self, env, ins: Inspector, x, y) -> int:
-        scr = self.screen
-        y = self._rule(x, y)
+    def _section_stats(self, surf, env, ins: Inspector, x, y, w) -> int:
+        t = self.t
+        y = self._rule(surf, x, y, w)
         st = ins.stats()
         secs = max(env.tick / 60.0, 1e-9)
-        mean_ms = "-" if st["mean_ms"] is None else f"{st['mean_ms']:.0f}"
-        p95 = "-" if st["p95_ms"] is None else f"{st['p95_ms']:.0f}"
-        self._text(scr, f"applied {st['applied']}  failed {st['failed']}  dropped {st['dropped']}  "
-                        f"superseded {st['superseded']}", (x, y), TEXT, self.f_small)
-        y += 16
-        self._text(scr, f"missed slots {st['missed']}  latency mean {mean_ms}ms p95 {p95}ms", (x, y), TEXT,
-                   self.f_small)
-        y += 16
-        self._text(scr, f"rate {st['applied'] / secs:.1f} decisions/s  (max {env.config.decision_hz:g}Hz, "
-                        f"{env.config.max_inflight} in flight)", (x, y), TEXT, self.f_small)
-        y += 18
+        mean_ms = "–" if st["mean_ms"] is None else f"{st['mean_ms']:.0f}"
+        p95 = "–" if st["p95_ms"] is None else f"{st['p95_ms']:.0f}"
+        cells = [("applied", st["applied"], TEXT), ("failed", st["failed"], BAD if st["failed"] else TEXT),
+                 ("superseded", st["superseded"], TEXT), ("missed", st["missed"], TEXT)]
+        cw = w // len(cells)
+        for i, (label, val, col) in enumerate(cells):
+            t.text(surf, str(val), (x + i * cw, y), col, 16, bold=True, mono=True)
+            t.text(surf, label, (x + i * cw, y + t.u(21)), FAINT, 11)
+        y += t.u(40)
+        t.text(surf, f"latency mean {mean_ms} ms · p95 {p95} ms", (x, y), TEXT, 12)
+        t.text(surf, f"{st['applied'] / secs:.1f}/s of {env.config.decision_hz:g} Hz", (x + w, y), MUTED, 12,
+               anchor="topright")
+        y += t.u(20)
         recent = st["recent_ms"]
-        h = 40
-        bw = self.PANEL_W - 28
-        pygame.draw.rect(scr, (22, 24, 30), (x, y, bw, h))
+        h = t.u(38)
+        pygame.draw.rect(surf, SURFACE_2, (x, y, w, h), border_radius=t.u(4))
         if recent:
             top = max(max(recent) * 1.1, 1000.0 / env.config.decision_hz * 1.5)
-            period_y = y + h - int(h * (1000.0 / env.config.decision_hz) / top)
-            for i in range(0, bw, 6):
-                pygame.draw.line(scr, (80, 80, 90), (x + i, period_y), (x + i + 3, period_y))
-            step = bw / max(1, 60)
+            py = y + h - int(h * (1000.0 / env.config.decision_hz) / top)
+            for i in range(0, w, t.u(6)):
+                pygame.draw.line(surf, FAINT, (x + i, py), (x + i + t.u(3), py))
+            step = w / 60
             for i, v in enumerate(recent):
-                bh = int(h * v / top)
-                pygame.draw.rect(scr, WARN, (x + int(i * step), y + h - bh, max(2, int(step) - 1), bh))
-            self._text(scr, f"{top:.0f}ms", (x + bw - 50, y), DIM, self.f_small)
-        y += h + 2
-        self._text(scr, "latency per decision (dashed = decision period)", (x, y), DIM, self.f_small)
-        return y + 20
+                bh = max(t.u(2), int((h - t.u(2)) * v / top))
+                pygame.draw.rect(surf, WARN, (x + int(i * step), y + h - bh, max(t.u(2), int(step) - t.u(1)), bh))
+            t.text(surf, f"{top:.0f} ms", (x + w - t.u(4), y + t.u(2)), MUTED, 10, anchor="topright")
+        y += h + t.u(4)
+        t.text(surf, "latency per decision   (dashed = decision period)", (x, y), FAINT, 10.5)
+        return y + t.u(22)
 
-    def _section_recent(self, ins: Inspector, x, y) -> int:
-        scr = self.screen
-        y = self._rule(x, y)
-        self._text(scr, "  id   t(s)  action  conf  latency  delay", (x, y), DIM, self.f_small)
-        y += 16
+    def _section_recent(self, surf, ins: Inspector, x, y, bottom) -> int:
+        t = self.t
+        y = self._rule(surf, x, y, self.display.size[0] - x - t.u(18))
+        cols = [("id", 0), ("t (s)", 44), ("action", 104), ("conf", 170), ("latency", 222), ("delay", 300)]
+        for label, cx in cols:
+            t.text(surf, label, (x + t.u(cx), y), FAINT, 11)
+        y += t.u(18)
         for r in reversed(ins.records):
-            if y > self.H - 40:
+            if y > bottom - t.u(16):
                 break
             conf = (r.meta or {}).get("confidence")
-            cs = f"{conf:.2f}" if isinstance(conf, (int, float)) else "  - "
             color = STATUS_COLOR[r.status]
-            act = r.action or r.status.upper()
-            self._text(scr, f"{r.id:4d} {r.request_tick / 60:6.2f}  {act:<6} {cs}  {r.latency_ms:5.0f}ms  "
-                            f"+{r.delay_ticks}t", (x, y), color, self.f_small)
-            y += 15
+            vals = [f"{r.id}", f"{r.request_tick / 60:.2f}", r.action or r.status,
+                    f"{conf:.2f}" if isinstance(conf, (int, float)) else "–", f"{r.latency_ms:.0f} ms",
+                    f"+{r.delay_ticks}t"]
+            for (label, cx), v in zip(cols, vals):
+                t.text(surf, v, (x + t.u(cx), y), color, 11.5, mono=True)
+            y += t.u(17)
         return y
 
-    def _section_json(self, title, payload, x, y) -> int:
-        scr = self.screen
-        y = self._rule(x, y)
-        self._text(scr, title + "  (floats rounded for display)", (x, y), DIM, self.f_small)
-        y += 18
+    def _section_json(self, surf, title, payload, x, y, w, bottom) -> int:
+        t = self.t
+        y = self._rule(surf, x, y, w)
+        t.text(surf, title + "   (floats rounded for display)", (x, y), MUTED, 11.5)
+        y += t.u(20)
         if payload is None:
-            self._text(scr, "(nothing yet)", (x, y), DIM)
-            return y + 20
-        max_chars = max(20, (self.PANEL_W - 28) // self.f_small.size("0")[0])
+            t.text(surf, "(nothing yet)", (x, y), FAINT, 12)
+            return y + t.u(20)
+        cw = max(1, t.text_width("0", 11, mono=True))
+        max_chars = max(20, w // cw)
         lines = []
         for line in compact_json(payload):
             while len(line) > max_chars:  # wrap, never silently cut
                 lines.append(line[:max_chars])
                 line = "      " + line[max_chars:]
             lines.append(line)
+        lh = t.u(15)
         for line in lines:
-            if y > self.H - 40:
-                self._text(scr, "...", (x, y), DIM, self.f_small)
+            if y > bottom - lh:
+                t.text(surf, "…", (x, y), FAINT, 11, mono=True)
                 break
-            self._text(scr, line, (x, y), TEXT, self.f_small)
-            y += 14
+            t.text(surf, line, (x, y), TEXT, 11, mono=True)
+            y += lh
         return y
-
-    def close(self) -> None:
-        pygame.quit()

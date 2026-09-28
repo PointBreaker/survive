@@ -69,12 +69,13 @@ def test_event_tick_ordering_is_monotonic_in_logs(tmp_path):
 def test_viewer_and_live_gui_render_headless(tmp_path):
     run_logged(tmp_path, seconds=3)
     shot = tmp_path / "v.png"
-    run_viewer(tmp_path / "ep", start="collision", max_frames=5, screenshot=str(shot), panel="request", scale=0.5)
+    run_viewer(tmp_path / "ep", start="collision", max_frames=5, screenshot=str(shot), panel="request",
+               window=(900, 600))
     assert shot.stat().st_size > 0
     from main import main as gui_main
 
     shot2 = tmp_path / "live.png"
-    assert gui_main(["--controller", "simple_avoid", "--frames", "5", "--no-log", "--scale", "0.5",
+    assert gui_main(["--controller", "simple_avoid", "--frames", "5", "--no-log", "--window", "900x600",
                      "--screenshot", str(shot2)]) == 0
     assert shot2.stat().st_size > 0
 

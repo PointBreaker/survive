@@ -31,7 +31,6 @@ from arena.environment import Environment
 from arena.inspector import TICK_MS, Inspector, event_tick, timeline_data
 from arena.replay import actions_per_tick
 
-SPEEDS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0)
 SNAPSHOT_EVERY = 60
 
 
@@ -102,124 +101,14 @@ class Playback:
         return self.actions[min(tick, self.total - 1)].value
 
 
-def run_viewer(path: Path | str, renderer=None, start: Optional[str] = None,
-               max_frames: int = 0, screenshot: Optional[str] = None, panel: str = "decisions",
-               scale: Optional[float] = None) -> None:
-    import pygame
+def run_viewer(path: Path | str, start: Optional[str] = None, max_frames: int = 0,
+               screenshot: Optional[str] = None, panel: str = "decisions",
+               window: Optional[tuple[int, int]] = None) -> None:
+    from arena.app import run_app
 
-    from arena.renderer import PANEL_MODES, Renderer
-
-    dirs = episode_dirs(Path(path))
-    ep = 0
-    pb = Playback(dirs[ep])
-    own = renderer is None
-    if own:
-        renderer = Renderer(pb.config.arena_width, pb.config.arena_height, title="Decision Arena replay",
-                            timeline=True, scale=scale)
-    clock = pygame.time.Clock()
-    tick = 0.0
-    playing = True
-    speed_i = SPEEDS.index(1.0)
-    debug, ghost, compass = False, True, True
-    panel_mode = PANEL_MODES.index(panel)
-    dragging = False
-
-    def jump_collision():
-        if pb.collision_tick is not None:
-            return float(max(0, pb.collision_tick - 120)), False
-        return tick, playing
-
-    if start == "collision":
-        tick, playing = jump_collision()
-    frames = 0
-
-    while True:
-        for ev in pygame.event.get():
-            if ev.type == pygame.QUIT:
-                if own:
-                    renderer.close()
-                return
-            if ev.type == pygame.KEYDOWN:
-                shift = ev.mod & pygame.KMOD_SHIFT
-                if ev.key in (pygame.K_ESCAPE, pygame.K_q):
-                    if own:
-                        renderer.close()
-                    return
-                elif ev.key == pygame.K_SPACE:
-                    if tick >= pb.total:
-                        tick = 0.0
-                    playing = not playing
-                elif ev.key == pygame.K_RIGHT:
-                    tick, playing = min(pb.total, int(tick) + (10 if shift else 1)), False
-                elif ev.key == pygame.K_LEFT:
-                    tick, playing = max(0, int(tick) - (10 if shift else 1)), False
-                elif ev.key == pygame.K_PERIOD:
-                    i = bisect.bisect_right(pb.decision_ticks, int(tick))
-                    if i < len(pb.decision_ticks):
-                        tick, playing = pb.decision_ticks[i], False
-                elif ev.key == pygame.K_COMMA:
-                    i = bisect.bisect_left(pb.decision_ticks, int(tick)) - 1
-                    if i >= 0:
-                        tick, playing = pb.decision_ticks[i], False
-                elif ev.key == pygame.K_RIGHTBRACKET:
-                    speed_i = min(len(SPEEDS) - 1, speed_i + 1)
-                elif ev.key == pygame.K_LEFTBRACKET:
-                    speed_i = max(0, speed_i - 1)
-                elif ev.key == pygame.K_HOME:
-                    tick = 0.0
-                elif ev.key == pygame.K_END:
-                    tick, playing = float(pb.total), False
-                elif ev.key == pygame.K_c:
-                    tick, playing = jump_collision()
-                elif ev.key in (pygame.K_PAGEDOWN, pygame.K_PAGEUP) and len(dirs) > 1:
-                    ep = (ep + (1 if ev.key == pygame.K_PAGEDOWN else -1)) % len(dirs)
-                    pb = Playback(dirs[ep])
-                    tick, playing = 0.0, True
-                elif ev.key == pygame.K_j:
-                    panel_mode = (panel_mode + 1) % len(PANEL_MODES)
-                elif ev.key == pygame.K_g:
-                    ghost = not ghost
-                elif ev.key == pygame.K_p:
-                    compass = not compass
-                elif ev.key in (pygame.K_F1, pygame.K_TAB):
-                    debug = not debug
-            elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1 and renderer.timeline_rect.collidepoint(ev.pos):
-                dragging, playing = True, False
-                tick = float(renderer.timeline_tick_at(ev.pos[0], pb.total))
-            elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
-                dragging = False
-            elif ev.type == pygame.MOUSEMOTION and dragging:
-                tick = float(renderer.timeline_tick_at(ev.pos[0], pb.total))
-
-        if playing:
-            tick += SPEEDS[speed_i]
-            if tick >= pb.total:
-                tick, playing = float(pb.total), False
-        t = int(tick)
-        env = pb.env_at(t)
-        ins = pb.inspector_at(t)
-        last = ins.last_applied()
-        lat = last.latency_ms if last else None
-        req = ins.inflight() or (ins.requests.get(ins.records[-1].id) if ins.records else None)
-        raw_req = {"observation": req["observation"]} if req else None
-        raw_resp = ({k: v for k, v in ins.records[-1].__dict__.items() if v is not None} if ins.records else None)
-        state = "PLAYING" if playing else "PAUSED"
-        label = (f"{state} {SPEEDS[speed_i]:g}x   tick {t}/{pb.total}  ({t * TICK_MS / 1000:.2f}s controller time)"
-                 f"   episode {ep + 1}/{len(dirs)}  {pb.run_dir.name}")
-        header = [f"replay  {pb.controller}  seed {pb.seed}", "Space  ,/. decision  <-/-> tick  [] speed  C crash"]
-        renderer.draw(env, pb.controller, pb.action_at(t), lat, debug, inspector=ins, ghost=ghost,
-                      compass=compass, panel_mode=PANEL_MODES[panel_mode], header=header,
-                      raw_request=raw_req, raw_response=raw_resp,
-                      status=f"REPLAY {state} {SPEEDS[speed_i]:g}x",
-                      timeline=timeline_data(ins, pb.total, t, label))
-        clock.tick(60)
-        frames += 1
-        if max_frames and frames >= max_frames:
-            if screenshot:
-                pygame.image.save(renderer.screen, screenshot)
-            if own:
-                renderer.close()
-            return
+    episode_dirs(Path(path))  # fail early with a clear message
+    run_app(start="replay", replay_path=Path(path), replay_at=start, panel=panel, max_frames=max_frames,
+            screenshot=screenshot, window=window)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -227,12 +116,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("path", help="episode dir (with events.jsonl) or a benchmark run dir")
     ap.add_argument("--at", choices=("start", "collision"), default="start")
     ap.add_argument("--panel", choices=("decisions", "request", "response"), default="decisions")
-    ap.add_argument("--scale", type=float, default=None, help="arena zoom (default: fit screen)")
     ap.add_argument("--frames", type=int, default=0, help=argparse.SUPPRESS)
     ap.add_argument("--screenshot", default=None, help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
     run_viewer(Path(args.path), start=args.at, max_frames=args.frames, screenshot=args.screenshot,
-               panel=args.panel, scale=args.scale)
+               panel=args.panel)
     return 0
 
 

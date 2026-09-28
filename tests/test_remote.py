@@ -63,14 +63,39 @@ def test_wire_payload_is_exactly_the_unified_observation(server_factory):
 
 
 def test_remote_policy_reproduces_in_process_policy_exactly(server_factory):
-    """Same observations -> same policy -> same actions, across a process boundary."""
+    """Same observations -> same policy -> same actions, across a process boundary.
+
+    Checked per decision, so the result does not depend on which physics tick
+    each answer happened to land in (that part is timing, charged honestly).
+    """
+    from arena.recorder import Recorder
+
+    class Events(Recorder):
+        def __init__(self):
+            self.events = []
+
+        def event(self, data):
+            self.events.append(data)
+
+        def write_result(self, result):
+            pass
+
     srv = server_factory(policy="simple_avoid", latency_ms=100)
-    c = cfg(max_duration=4.0)
-    remote = EpisodeRunner(Environment(c, 3), RemoteController(endpoint=srv.url)).run()
-    local = EpisodeRunner(Environment(c, 3), LatencyWrapper(SimpleAvoidController(), 100)).run()
-    assert remote["action_changes"] == local["action_changes"]
-    assert remote["ticks"] == local["ticks"] and remote["reason"] == local["reason"]
+    rec = Events()
+    env = Environment(cfg(max_duration=4.0), 3)
+    remote = EpisodeRunner(env, RemoteController(endpoint=srv.url), recorder=rec).run()
     assert remote["mean_decision_latency_ms"] >= 100
+    obs_by_id = {e["id"]: e["observation"] for e in rec.events if e["type"] == "request"}
+    answers = {e["id"]: e["action"] for e in rec.events if e["type"] in ("decision", "decision_superseded")}
+    local = SimpleAvoidController()
+    local.reset(env.public_info())
+    checked = 0
+    for rid in sorted(obs_by_id):
+        action = local.decide(Observation.from_dict(obs_by_id[rid])).value
+        if rid in answers:
+            assert answers[rid] == action, f"request {rid}"
+            checked += 1
+    assert checked >= 10
 
 
 def test_slow_service_does_not_pause_world(server_factory):
