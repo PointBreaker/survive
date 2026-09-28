@@ -55,3 +55,23 @@ def threshold_level(curve: Sequence[tuple[float, float]], p: float) -> Optional[
         if s0 >= p > s1:
             return l0 + (s0 - p) / (s0 - s1) * (l1 - l0)
     return pts[-1][0]  # never dropped below p in the tested range
+
+
+def threshold_summary(curve: Sequence[tuple[float, float]], p: float) -> dict[str, Any]:
+    """``threshold_level`` plus *how* it was obtained, so a UI never overstates it.
+
+    kind:
+      interpolated  the measured curve crosses p inside the tested range
+      above_range   success stayed >= p at every tested level (value = highest level, a lower bound)
+      below_range   success was already < p at the lowest tested level (value = that level, an upper bound)
+      not_measured  no data
+    """
+    pts = sorted(curve)
+    if not pts:
+        return {"value": None, "kind": "not_measured", "p": p}
+    value = threshold_level(pts, p)
+    if value is None:
+        return {"value": pts[0][0], "kind": "below_range", "p": p}
+    if all(s >= p for _, s in pts):
+        return {"value": pts[-1][0], "kind": "above_range", "p": p}
+    return {"value": value, "kind": "interpolated", "p": p}

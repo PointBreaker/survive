@@ -84,8 +84,58 @@ benchmark/
   metrics.py              aggregation, Wilson CI, threshold (D90/D50/D10) helper
   adaptive.py             staircase search for the failure frontier
   remote_validation.py    remote (real latency) vs simulated latency, paired per seed
+  suite.py                controllers x swept level x paired seeds -> complete frontier artifact
+arena/dashboard_api.py    read-only JSON API over runs/ (+ serves dashboard/dist)
+dashboard/                React + TypeScript + Vite + Recharts web dashboard
 tests/                    physics, collision, observation, determinism, isolation, async, headless
 ```
+
+## Web benchmark dashboard
+
+A read-only web view of benchmark results. Its centerpiece is the **Capability
+Frontier**: how much real-time pressure each controller survives.
+
+```bash
+# 1. produce a frontier: controllers x one swept pressure x paired seeds
+python -m benchmark.suite --controllers jev,simple_avoid,greedy,random \
+    --param world_speed_scale --levels 0.25,0.5,1,2,4,8 --episodes 20
+#    (optional: add a latency-matched baseline, e.g. simple_avoid+300ms)
+
+# 2. build the UI once, then serve API + UI
+cd dashboard && npm install && npm run build && cd ..
+python -m arena.dashboard_api          # http://127.0.0.1:8787
+```
+
+For development, run `npm run dev` in `dashboard/` (port 5173, proxies `/api`).
+
+* **Benchmark page:**
+  - The frontier: success rate, avg survival, targets or latency, plotted
+    against world speed, obstacle count or added latency. It has 95% Wilson
+    bands and a per-level tooltip.
+  - Key results with **empirical D50**, always labeled with how it was
+    measured: interpolated, `≥` (never dropped below 50%), or `<` (already
+    below 50% at the lowest tested level).
+  - Purely computed facts: median latency vs decision period, and the share
+    of answers slower than one period.
+  - Failure analysis (only the environment's real endings: collision, target
+    timeout).
+  - Latency histogram with p50, p95 and decision-period lines.
+  - Action, confidence and decision-slot accounting.
+  - Same-seed compare.
+* **Compare:** side-by-side replays with one shared scrubber. Each replay is
+  re-simulated in Python by `arena.replay` from config + seed + logged actions
+  and verified against the logged result. No physics runs in JavaScript.
+* **Runs:** everything under `runs/`.
+* **Live Arena:** points to the desktop app (`python main.py`).
+* **Sidebar:** builds the exact `benchmark.suite` command for a new
+  experiment. Suites appear in the selector while they run and update live.
+
+Integrity:
+* `arena/dashboard_api.py` only reads artifacts and re-simulates for replay.
+  A test checks that it imports no runner.
+* Aggregates and thresholds come from `benchmark.metrics`.
+* `benchmark/suite.py` only orchestrates the existing `run_episodes`.
+* Environment, physics, observation, runner and controllers were not changed.
 
 ## Desktop console (GUI)
 
