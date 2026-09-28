@@ -6,9 +6,10 @@ Timing model
   advances the world by ``world_speed_scale / 60`` world seconds.
 * Decision slots occur every ``60 / decision_hz`` ticks. At a slot, if fewer
   than ``max_inflight`` requests are outstanding, the current observation is
-  captured and handed to ``controller.request``. Otherwise the slot is
-  counted as missed and served (with a fresh observation) on the tick a
-  request frees up. So ``decision_hz`` is a maximum rate.
+  captured and handed to ``controller.request``. Otherwise the slot waits
+  and is served (with a fresh observation) on the tick a request frees up
+  (counted as *delayed*); if the next slot arrives first, the waiting one
+  is *missed* (never served). So ``decision_hz`` is a maximum rate.
 * With several requests in flight, answers can arrive out of order. At each
   tick the newest ready answer is applied; an answer to an older request
   than the one already applied (or than another ready one) is *superseded*
@@ -64,7 +65,8 @@ class _Pending:
 class DecisionStats:
     requests: int = 0
     applied: int = 0
-    missed_slots: int = 0
+    missed_slots: int = 0  # slots that never got their own request
+    delayed_slots: int = 0  # slots served late because all requests were busy
     late_dropped: int = 0
     failed: int = 0
     superseded: int = 0
@@ -101,6 +103,7 @@ class EpisodeRunner:
         self._slot_period = physics.PHYSICS_HZ / cfg.decision_hz
         self._next_slot = 0.0
         self._slot_owed = False
+        self._slot_owed_since: Optional[int] = None
         self._deadline_s = None if cfg.decision_deadline_ms is None else cfg.decision_deadline_ms / 1000.0
 
         info = env.public_info()
@@ -157,11 +160,16 @@ class EpisodeRunner:
             while self._next_slot <= k + 1e-9:
                 self._next_slot += self._slot_period
             if len(self._pendings) >= self._max_inflight:
-                self.stats.missed_slots += 1
-                self.recorder.event({"type": "missed_slot", "tick": k, "pending_ids": list(self._pendings)})
+                if self._slot_owed:  # an earlier owed slot is superseded by this one: lost
+                    self.stats.missed_slots += 1
+                    self.recorder.event({"type": "missed_slot", "tick": k, "pending_ids": list(self._pendings)})
+                self._slot_owed_since = k
             self._slot_owed = True
         if self._slot_owed and len(self._pendings) < self._max_inflight:
+            if self._slot_owed_since is not None:  # served late, but served
+                self.stats.delayed_slots += 1
             self._slot_owed = False
+            self._slot_owed_since = None
             self._issue_request(k)
 
         events = env.step(self.current_action)
@@ -333,6 +341,7 @@ class EpisodeRunner:
             "decision_count": st.applied,
             "request_count": st.requests,
             "missed_slots": st.missed_slots,
+            "delayed_slots": st.delayed_slots,
             "late_dropped": st.late_dropped,
             "failed_decisions": st.failed,
             "superseded_decisions": st.superseded,

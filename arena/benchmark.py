@@ -55,7 +55,8 @@ def print_summary(title: str, agg: dict[str, Any]) -> None:
     print(f"average survival  {_fmt(agg['mean_survival_time'])} s (world)")
     print(f"mean latency      {_fmt(agg['mean_latency_ms'], 3)} ms")
     print(f"p95 latency       {_fmt(agg['p95_latency_ms'], 3)} ms")
-    print(f"missed slots/ep   {_fmt(agg['mean_missed_slots'])}")
+    print(f"missed slots/ep   {_fmt(agg['mean_missed_slots'])}  (never served; delayed/ep "
+          f"{_fmt(agg['mean_delayed_slots'])})")
     print(f"failure reasons   {agg['failure_reasons'] or '-'}")
 
 

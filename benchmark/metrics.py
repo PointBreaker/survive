@@ -35,6 +35,7 @@ def aggregate(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "mean_latency_ms": mean(lat),
         "p95_latency_ms": percentile(p95, 50) if p95 else None,  # median of per-episode p95
         "mean_missed_slots": mean([r["missed_slots"] for r in results]),
+        "mean_delayed_slots": mean([r.get("delayed_slots", 0) for r in results]),
         "failure_reasons": dict(Counter(r["reason"] for r in results if not r["success"])),
     }
 
