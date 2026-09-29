@@ -100,7 +100,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     manifest: dict[str, Any] = {
         "kind": "shadow", "version": 1, "created": time.strftime("%Y-%m-%dT%H:%M:%S"), "status": "running",
         "pid": os.getpid(), "driver": args.driver, "shadows": names[1:], "interval_s": args.interval,
-        "delay_s": args.delay, "episodes": args.episodes, "base_seed": args.seed,
+        "delay_s": args.delay, "observation_mode": args.observation_mode, "episodes": args.episodes, "base_seed": args.seed,
         "seeds": [args.seed + i for i in range(args.episodes)], "config": cfg.to_dict(),
         "branch_every_s": None if args.no_branches else args.branch_every,
         "takeover_s": None if args.no_branches else args.takeover, "argv": sys.argv[1:] if argv is None else argv,

@@ -107,6 +107,7 @@ def main(argv: list[str] | None = None) -> int:
         "episodes": args.episodes,
         "latency_ms": args.latency_ms,
         "real_latency": args.real_latency,
+        "observation_mode": getattr(args, "observation_mode", "raw"),
         "config": base_cfg.to_dict(),
         "argv": sys.argv[1:] if argv is None else argv,
     }

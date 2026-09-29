@@ -12,7 +12,8 @@ from arena.runner import EpisodeRunner
 from controllers.base import SyncController
 
 CONTROLLERS_DIR = Path(__file__).resolve().parents[1] / "controllers"
-ALLOWED_ARENA_MODULES = {"arena.action", "arena.observation"}
+# observation_views is part of the public observation interface: a pure function of an Observation
+ALLOWED_ARENA_MODULES = {"arena.action", "arena.observation", "arena.observation_views"}
 REMOTE_DIR = Path(__file__).resolve().parents[1] / "remote"
 FORBIDDEN_MODULES = {"arena.environment", "arena.physics", "arena.entities", "arena.runner",
                      "arena.replay", "arena.recorder", "benchmark", "gc", "inspect", "ctypes"}

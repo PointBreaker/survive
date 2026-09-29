@@ -33,6 +33,8 @@ def add_difficulty_args(ap: argparse.ArgumentParser) -> None:
         action="store_true",
         help="withhold decisions for --latency-ms of real wall time instead of charging it in sim ticks",
     )
+    c.add_argument("--observation-mode", choices=("raw", "relative", "physics"), default="raw",
+                   help="controller-facing observation (arena.observation_views); raw = unchanged canonical state")
     c.add_argument("--controller-seed", type=int, default=12345, help="RNG seed of the random controller")
     c.add_argument("--sleep-ms", type=float, default=500.0, help="delay of the diagnostic sleep controller")
     c.add_argument("--endpoint", default=None,
@@ -84,8 +86,14 @@ def controller_factory(name: str, args: argparse.Namespace, latency_ms: Optional
     except (RuntimeError, ValueError) as e:
         raise SystemExit(f"error: {e}")
 
+    mode = getattr(args, "observation_mode", None) or "raw"
+
     def factory():
         ctrl = make_controller(name, **kwargs)
+        if mode != "raw":
+            from arena.observation_views import ObservationView
+
+            ctrl = ObservationView(ctrl, mode)
         if delay and delay > 0:
             ctrl = LatencyWrapper(ctrl, delay, simulated=not args.real_latency)
         return ctrl

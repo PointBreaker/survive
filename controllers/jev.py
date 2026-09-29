@@ -190,6 +190,20 @@ class JevController(RemoteController):
         timeout = timeout_s if timeout_s is not None else float(os.environ.get("JEV_TIMEOUT_S") or 10)
         super().__init__(endpoint=endpoint, timeout_s=timeout, headers={"Authorization": f"Bearer {api_key}"})
         self._rules: dict[str, Any] = {}
+        self.observation_mode = "raw"
+
+    def set_observation_mode(self, mode: str) -> None:
+        """Called by ``arena.observation_views.ObservationView``: explain the extra fields (formulas only)."""
+        from arena.observation_views import FIELD_DEFINITIONS
+
+        if mode not in FIELD_DEFINITIONS:
+            raise ValueError(f"unknown observation mode {mode!r}")
+        self.observation_mode = mode
+
+    def instructions(self) -> str:
+        from arena.observation_views import FIELD_DEFINITIONS
+
+        return INSTRUCTIONS + FIELD_DEFINITIONS[self.observation_mode]
 
     def reset(self, info: ArenaInfo) -> None:
         super().reset(info)
@@ -202,7 +216,7 @@ class JevController(RemoteController):
             "questions": {
                 "action": {
                     "type": "choice",
-                    "instructions": INSTRUCTIONS,
+                    "instructions": self.instructions(),  # == INSTRUCTIONS in raw mode
                     "criteria": dict(ACTION_CRITERIA),
                 }
             },

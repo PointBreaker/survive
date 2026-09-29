@@ -191,6 +191,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "seeds": [args.seed + i for i in range(args.episodes)],
         "config": base_cfg.to_dict(),
         "added_latency_ms": args.latency_ms,
+        "observation_mode": args.observation_mode,
         "timing": args.timing,
         **({"interval_s": args.interval, "delay_s": args.delay} if lockstep else {}),
         "observations_logged": bool(args.observations),
@@ -245,7 +246,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                                           progress=progress)
                     for i, r in enumerate(rs):
                         rec = {k: v for k, v in r.items() if k != "action_changes"}
-                        rec.update({"controller_spec": spec, "level": lv,
+                        rec.update({"controller_spec": spec, "level": lv, "observation_mode": args.observation_mode,
                                     "episode_dir": str((ep_dir / f"episode_{i:04d}_seed{r['seed']}").relative_to(out_dir))})
                         rf.write(json.dumps(rec, separators=(",", ":")) + "\n")
                         results.append(rec)
