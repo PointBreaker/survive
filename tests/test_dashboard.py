@@ -133,5 +133,6 @@ def test_dashboard_api_does_not_import_simulation_writers():
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.add(node.module)
             names |= {a.name for a in node.names}
-    assert not imported & {"arena.runner", "benchmark.runner", "benchmark.suite", "benchmark.adaptive"}
+    assert not imported & {"arena.runner", "benchmark.runner", "benchmark.suite", "benchmark.adaptive",
+                            "arena.lockstep", "benchmark.shadow", "benchmark.takeover"}
     assert not names & {"run_episodes", "EpisodeRunner", "find_frontier"}

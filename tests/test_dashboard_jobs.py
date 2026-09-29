@@ -162,3 +162,20 @@ def test_read_only_server_refuses_jobs(tmp_path):
         assert srv.api.jobs is None
     finally:
         srv.server_close()
+
+
+def test_build_argv_lockstep_and_shadow():
+    from arena.dashboard_jobs import build_shadow_argv
+
+    a = argv_of({"controllers": ["simple_avoid"], "timing": "lockstep", "interval": 0.1,
+                 "param": "decision_delay_ms", "levels": [0, 200], "max_inflight": 3})
+    assert a[a.index("--timing") + 1] == "lockstep" and "--max-inflight" not in a
+    for bad in ({"controllers": ["greedy"], "timing": "lockstep", "param": "world_speed_scale", "levels": [1]},
+                {"controllers": ["greedy"], "param": "decision_delay_ms", "levels": [0]},
+                {"controllers": ["greedy+100ms"], "timing": "lockstep", "param": "obstacle_count", "levels": [5]}):
+        with pytest.raises(JobError):
+            argv_of(bad)
+    s = build_shadow_argv({"shadows": ["simple_avoid", "random"], "episodes": 3, "branch_workers": 4}, BENCH, False)
+    assert s[:4] == ["--driver", "explorer", "--shadows", "simple_avoid,random"] and "--branch-workers" in s
+    with pytest.raises(JobError):
+        build_shadow_argv({"shadows": ["jev"]}, BENCH, False)

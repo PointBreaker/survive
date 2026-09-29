@@ -1,6 +1,7 @@
-"""Start benchmark suites from the dashboard.
+"""Start benchmark suites and shadow runs from the dashboard.
 
-A job is exactly ``python -m benchmark.suite ...`` run as a subprocess. That's
+A job is exactly ``python -m benchmark.suite ...`` (or ``benchmark.shadow``)
+run as a subprocess. That's
 the same CLI, the same runner and the same semantics as a terminal run. This
 module only validates a request, builds the argument list (never a shell
 string), watches the process and reads the suite's own progress fields.
@@ -38,7 +39,10 @@ LEVEL_BOUNDS = {
     "latency_ms": (0, 10000),
     "obstacle_speed_max": (1, 2000),
     "spawn_rate": (0, 50),
+    "decision_delay_ms": (0, 5000),
 }
+LOCKSTEP_ONLY = {"decision_delay_ms"}
+REALTIME_ONLY = {"world_speed_scale", "latency_ms"}
 
 
 class JobError(Exception):
@@ -75,9 +79,18 @@ def build_argv(spec: dict[str, Any], benchmarkable: list[str], jev_token: bool) 
         if c not in clean:
             clean.append(str(c))
 
+    timing = spec.get("timing", "realtime")
+    if timing not in ("realtime", "lockstep"):
+        raise JobError(400, "timing must be realtime or lockstep")
     param = spec.get("param", "world_speed_scale")
     if param not in LEVEL_BOUNDS:
         raise JobError(400, f"param must be one of {sorted(LEVEL_BOUNDS)}")
+    if timing == "lockstep" and param in REALTIME_ONLY:
+        raise JobError(400, f"{param} has no meaning in lockstep timing")
+    if timing == "realtime" and param in LOCKSTEP_ONLY:
+        raise JobError(400, f"{param} requires lockstep timing")
+    if timing == "lockstep" and any("+" in c for c in clean):
+        raise JobError(400, "added latency (+ms) is meaningless in lockstep; sweep decision_delay_ms instead")
     levels = spec.get("levels")
     if not isinstance(levels, list) or not 1 <= len(levels) <= 12:
         raise JobError(400, "levels: choose 1 to 12")
@@ -95,6 +108,11 @@ def build_argv(spec: dict[str, Any], benchmarkable: list[str], jev_token: bool) 
 
     argv = ["--controllers", ",".join(clean), "--param", param, "--levels", ",".join(f"{v:g}" for v in lv),
             "--episodes", str(episodes), "--preset", preset]
+    if timing == "lockstep":
+        argv += ["--timing", "lockstep", "--interval", f"{_num(spec, 'interval', 0.02, 2, default=0.1):g}"]
+        d = _num(spec, "delay", 0, 5, default=None)
+        if d:
+            argv += ["--delay", f"{d:g}"]
     optional = [
         ("seed", "--seed", 0, 10**9, True),
         ("obstacles", "--obstacles", 0, 400, True),
@@ -107,6 +125,46 @@ def build_argv(spec: dict[str, Any], benchmarkable: list[str], jev_token: bool) 
     for key, flag, a, b, integer in optional:
         if key == "obstacles" and param == "obstacle_count":
             continue
+        if timing == "lockstep" and key in ("decision_hz", "max_inflight", "deadline_ms"):
+            continue
+        v = _num(spec, key, a, b, integer)
+        if v is not None:
+            argv += [flag, f"{v:g}" if isinstance(v, float) else str(v)]
+    return argv
+
+
+def build_shadow_argv(spec: dict[str, Any], benchmarkable: list[str], jev_token: bool) -> list[str]:
+    """Validate a shadow-run request and turn it into ``benchmark.shadow`` arguments."""
+    shadows = spec.get("shadows")
+    if not isinstance(shadows, list) or not 1 <= len(shadows) <= 6:
+        raise JobError(400, "shadows: choose 1 to 6 controllers to score")
+    clean: list[str] = []
+    for c in shadows:
+        c = str(c)
+        if c not in benchmarkable:
+            raise JobError(400, f"unknown controller {c!r}")
+        if c == "jev" and not jev_token:
+            raise JobError(400, "Jev needs OPENROUTER_API_KEY (or TYPESAFE_API_KEY) in .env")
+        if c not in clean:
+            clean.append(c)
+    driver = str(spec.get("driver", "explorer"))
+    if driver != "explorer" and driver not in benchmarkable:
+        raise JobError(400, f"unknown driver {driver!r}")
+    if driver == "jev" and not jev_token:
+        raise JobError(400, "Jev needs OPENROUTER_API_KEY (or TYPESAFE_API_KEY) in .env")
+    preset = spec.get("preset", "medium")
+    if preset not in PRESETS:
+        raise JobError(400, f"preset must be one of {sorted(PRESETS)}")
+    episodes = _num(spec, "episodes", 1, 200, integer=True, default=10)
+    interval = _num(spec, "interval", 0.02, 2, default=0.1)
+    every = _num(spec, "branch_every", 0.25, 30, default=1.0)
+    takeover = _num(spec, "takeover", 0.5, 10, default=3.0)
+    argv = ["--driver", driver, "--shadows", ",".join(clean), "--episodes", str(episodes), "--preset", preset,
+            "--interval", f"{interval:g}", "--branch-every", f"{every:g}", "--takeover", f"{takeover:g}"]
+    for key, flag, a, b, integer in [("delay", "--delay", 0, 5, False), ("seed", "--seed", 0, 10**9, True),
+                                     ("obstacles", "--obstacles", 0, 400, True),
+                                     ("max_duration", "--max-duration", 1, 600, False),
+                                     ("branch_workers", "--branch-workers", 1, 16, True)]:
         v = _num(spec, key, a, b, integer)
         if v is not None:
             argv += [flag, f"{v:g}" if isinstance(v, float) else str(v)]
@@ -121,6 +179,7 @@ class Job:
     log_path: Path
     started: float
     proc: subprocess.Popen
+    kind: str = "suite"  # or "shadow"
     ended: Optional[float] = None
     cancel_requested: bool = False
     tail: deque = field(default_factory=lambda: deque(maxlen=60))
@@ -140,7 +199,7 @@ class Job:
         status = self.status
         progress = None
         suite_status = None
-        manifest = self.run_dir / "suite.json"
+        manifest = self.run_dir / f"{self.kind}.json"
         if manifest.is_file():
             try:
                 m = json.loads(manifest.read_text())
@@ -150,10 +209,11 @@ class Job:
         return {
             "id": self.id,
             "status": status,
+            "kind": self.kind,
             "suite_id": self.run_dir.name if manifest.is_file() else None,
             "suite_status": suite_status,
             "progress": progress,
-            "command": "python -m benchmark.suite " + " ".join(shlex.quote(a) for a in self.argv),
+            "command": f"python -m benchmark.{self.kind} " + " ".join(shlex.quote(a) for a in self.argv),
             "started": self.started,
             "ended": self.ended,
             "elapsed_s": (self.ended or time.time()) - self.started,
@@ -176,13 +236,18 @@ class JobManager:
         return None
 
     def start(self, spec: dict[str, Any], benchmarkable: list[str], jev_token: bool) -> dict[str, Any]:
-        argv = build_argv(spec, benchmarkable, jev_token)
+        kind = spec.get("kind", "suite")
+        if kind not in ("suite", "shadow"):
+            raise JobError(400, "kind must be suite or shadow")
+        argv = (build_shadow_argv if kind == "shadow" else build_argv)(spec, benchmarkable, jev_token)
         with self._lock:
             active = self._active()
             if active:
                 raise JobError(409, "a benchmark is already running; cancel it or wait (parallel suites would distort measured latency)")
-            param = argv[argv.index("--param") + 1]
-            run_dir = new_run_dir(self.root, "suite", param)
+            if kind == "shadow":
+                run_dir = new_run_dir(self.root, "shadow", argv[argv.index("--driver") + 1])
+            else:
+                run_dir = new_run_dir(self.root, "suite", argv[argv.index("--param") + 1])
             logs = self.root / ".jobs"
             logs.mkdir(parents=True, exist_ok=True)
             job_id = uuid.uuid4().hex[:10]
@@ -190,11 +255,11 @@ class JobManager:
             full = argv + ["--run-dir", str(run_dir)]
             log = open(log_path, "w")
             proc = subprocess.Popen(
-                [self.python, "-u", "-m", "benchmark.suite", *full],
+                [self.python, "-u", "-m", f"benchmark.{kind}", *full],
                 cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                 env={**os.environ, "PYTHONUNBUFFERED": "1"},
             )
-            job = Job(job_id, argv, run_dir, log_path, time.time(), proc)
+            job = Job(job_id, argv, run_dir, log_path, time.time(), proc, kind)
             self.jobs[job_id] = job
 
         def pump():

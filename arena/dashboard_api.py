@@ -21,11 +21,15 @@ Endpoints (JSON):
     GET /api/suites/<id>/episodes?controller=<spec>&level=<level>
     GET /api/suites/<id>/compare?level=<level>&seed=<seed>
     GET /api/suites/<id>/replay?episode=<relative episode dir>
+    GET /api/shadows
+    GET /api/shadows/<id>                                   manifest + takeover scores + episodes
+    GET /api/shadows/<id>/branches?episode=<name>           branch outcomes (no paths)
+    GET /api/shadows/<id>/branch?episode=<name>&tick=<k>    one branch with paths + obstacle frames
 
 Benchmark jobs (only when the server binds to localhost, see arena.dashboard_jobs):
     GET  /api/jobs            GET /api/jobs/<id>
     POST /api/jobs            POST /api/jobs/<id>/cancel
-Jobs run the unchanged ``python -m benchmark.suite`` CLI as a subprocess.
+Jobs run the unchanged ``python -m benchmark.suite`` / ``benchmark.shadow`` CLIs as subprocesses.
 """
 from __future__ import annotations
 
@@ -102,6 +106,13 @@ def classify_run(d: Path) -> Optional[dict[str, Any]]:
                 "levels": m["levels"], "controllers": m["controllers"], "status": effective_status(m),
                 "progress": m.get("progress"),
                 "episodes_per_point": m.get("episodes_per_point"), "created": m.get("created")}
+    if (d / "shadow.json").is_file():
+        m = _read_json(d / "shadow.json")
+        return {**base, "kind": "shadow", "title": f"shadow · {m['driver']}", "driver": m["driver"],
+                "controllers": m["shadows"], "status": effective_status(m), "progress": m.get("progress"),
+                "episodes": m.get("episodes"), "interval_s": m.get("interval_s"), "delay_s": m.get("delay_s"),
+                "preset_config": m.get("config"), "created": m.get("created"),
+                "scored": (d / "scores.json").is_file()}
     if (d / "summary.json").is_file():
         s = _read_json(d / "summary.json")
         if "levels" in s and "config" in s and isinstance(s.get("levels"), list) and "jitter_ms" in s:
@@ -261,7 +272,13 @@ def replay_episode(ep_dir: Path, max_frames: int = 2400) -> dict[str, Any]:
     if ev_path.is_file():
         for e in _read_jsonl(ev_path):
             t = e.get("type")
-            if t == "decision":
+            if t == "lockstep_decision":
+                a = (e.get("answers") or {}).get(cfg.get("controller")) or {}
+                if a.get("action"):
+                    timeline["decisions"].append({"tick": e["effective_tick"], "request_tick": e["tick"],
+                                                  "action": a["action"], "latency_ms": round(a["latency_ms"], 2),
+                                                  "confidence": a.get("confidence")})
+            elif t == "decision":
                 timeline["decisions"].append({"tick": e["applied_tick"], "request_tick": e["request_tick"],
                                               "action": e["action"], "latency_ms": round(e["latency_ms"], 2),
                                               "confidence": (e.get("meta") or {}).get("confidence")})
@@ -390,6 +407,65 @@ class DashboardAPI:
         stamp = (ep / "result.json").stat().st_mtime
         return self._cached(f"replay:{ep}", stamp, lambda: replay_episode(ep))
 
+    # ------------------------------------------------------------ shadows
+    def _shadow_dir(self, run_id: str) -> Path:
+        d = self._run_dir(run_id)
+        if not (d / "shadow.json").is_file():
+            raise ApiError(404, f"{run_id!r} is not a shadow run")
+        return d
+
+    def _shadow_episode(self, d: Path, episode: str) -> Path:
+        ep = (d / "episodes" / unquote(episode)).resolve()
+        if ep.parent != (d / "episodes").resolve() or not ep.is_dir():
+            raise ApiError(404, "episode not found in this shadow run")
+        return ep
+
+    def shadows(self) -> list[dict[str, Any]]:
+        return [r for r in self.runs() if r["kind"] == "shadow"]
+
+    def shadow(self, run_id: str) -> dict[str, Any]:
+        d = self._shadow_dir(run_id)
+        m = _read_json(d / "shadow.json")
+        m["status"] = effective_status(m)
+        scores = None
+        if (d / "scores.json").is_file():
+            try:
+                scores = _read_json(d / "scores.json")
+            except ValueError:
+                scores = None  # being replaced; next poll reads it
+        episodes = list(_read_jsonl(d / "results.jsonl")) if (d / "results.jsonl").is_file() else []
+        return {"id": d.name, "manifest": m, "scores": scores, "episodes": episodes}
+
+    def shadow_branches(self, run_id: str, episode: str) -> dict[str, Any]:
+        ep = self._shadow_episode(self._shadow_dir(run_id), episode)
+        path = ep / "branches.jsonl"
+        if not path.is_file():
+            return {"episode": ep.name, "branches": []}
+        keep = ("collided", "end_reason", "ticks", "targets", "approach", "min_clearance", "failed_answers")
+
+        def compute():
+            return {"episode": ep.name, "branches": [
+                {"tick": b["tick"], "t": b["t"], "driver_action": b.get("driver_action"),
+                 "outcomes": {c: {k: o.get(k) for k in keep} for c, o in b["outcomes"].items()}}
+                for b in _read_jsonl(path)]}
+        return self._cached(f"branches:{ep}", path.stat().st_mtime, compute)
+
+    def shadow_branch(self, run_id: str, episode: str, tick: str) -> dict[str, Any]:
+        d = self._shadow_dir(run_id)
+        ep = self._shadow_episode(d, episode)
+        m = _read_json(d / "shadow.json")
+        cfg = DifficultyConfig.from_dict(m["config"])
+        try:
+            k = int(float(tick))
+        except ValueError:
+            raise ApiError(400, "tick must be a number")
+        path = ep / "branches.jsonl"
+        for b in (_read_jsonl(path) if path.is_file() else []):
+            if b["tick"] == k:
+                return {**b, "arena": {"width": cfg.arena_width, "height": cfg.arena_height},
+                        "player_radius": cfg.player_radius, "path_every": 3, "frames_every": 6}
+        raise ApiError(404, f"no branch at tick {k}")
+
     # ------------------------------------------------------------- routing
     def route(self, path: str, query: dict[str, list[str]]) -> Any:
         q = {k: v[0] for k, v in query.items()}
@@ -402,6 +478,19 @@ class DashboardAPI:
             return self.suites()
         if len(parts) == 2 and parts[0] == "suites":
             return self.suite(parts[1])
+        if parts == ["shadows"]:
+            return self.shadows()
+        if len(parts) == 2 and parts[0] == "shadows":
+            return self.shadow(parts[1])
+        if len(parts) == 3 and parts[0] == "shadows":
+            if "episode" not in q:
+                raise ApiError(400, "episode is required")
+            if parts[2] == "branches":
+                return self.shadow_branches(parts[1], q["episode"])
+            if parts[2] == "branch":
+                if "tick" not in q:
+                    raise ApiError(400, "tick is required")
+                return self.shadow_branch(parts[1], q["episode"], q["tick"])
         if parts and parts[0] == "jobs":
             jobs = self._jobs()
             if len(parts) == 1:
