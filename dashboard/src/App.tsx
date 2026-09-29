@@ -1,15 +1,17 @@
-import { BarChart3, Gamepad2, GitCompareArrows, ListTree, Radar } from "lucide-react";
+import { BarChart3, FlaskConical, Gamepad2, GitCompareArrows, ListTree, Radar } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type Job, type JobSpec, type Meta, type RunInfo, type SuiteDetail } from "./api";
+import { api, type AblationJobSpec, type Job, type JobSpec, type Meta, type RunInfo, type SuiteDetail } from "./api";
 import { paramInfo } from "./format";
 import { controllerLabel } from "./theme";
+import { AblationPage } from "./pages/AblationPage";
 import { BenchmarkPage } from "./pages/BenchmarkPage";
 import { ComparePage, LiveArenaPage, RunsPage } from "./pages/OtherPages";
 
-type Route = "live" | "benchmark" | "compare" | "runs";
+type Route = "live" | "benchmark" | "ablation" | "compare" | "runs";
 const ROUTES: { id: Route; label: string; icon: typeof Radar }[] = [
   { id: "live", label: "Live Arena", icon: Gamepad2 },
   { id: "benchmark", label: "Benchmark", icon: BarChart3 },
+  { id: "ablation", label: "Ablation", icon: FlaskConical },
   { id: "compare", label: "Compare", icon: GitCompareArrows },
   { id: "runs", label: "Runs", icon: ListTree },
 ];
@@ -83,7 +85,7 @@ export default function App() {
     const j = jobs.find((x) => x.id === follow);
     if (j?.suite_id && runs.some((r) => r.id === j.suite_id)) {
       setFollow(null);
-      go("benchmark", j.suite_id);
+      go(j.kind === "ablation" ? "ablation" : "benchmark", j.suite_id);
     }
   }, [jobs, runs, follow]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -97,7 +99,7 @@ export default function App() {
     lastStatus.current = st;
   }, [job?.status, refreshRuns]);
 
-  const onRun = async (spec: JobSpec) => {
+  const onRun = async (spec: JobSpec | AblationJobSpec) => {
     const j = await api.startJob(spec);
     setDismissed(null);
     setFollow(j.id);
@@ -160,7 +162,7 @@ export default function App() {
         </nav>
         <div className="nav-right">
           {error && <span className="error" title={error}>API error</span>}
-          {suites.length > 0 && (
+          {suites.length > 0 && route !== "ablation" && (
             <select className="select" value={selectedId ?? ""} onChange={(e) => go(route === "runs" || route === "live" ? "benchmark" : route, e.target.value)} aria-label="benchmark suite">
               {suites.map((s) => (
                 <option key={s.id} value={s.id}>{suiteLabel(s)}</option>
@@ -182,8 +184,11 @@ export default function App() {
           onDismissJob={() => job && setDismissed(job.id)}
         />
       )}
+      {route === "ablation" && (
+        <AblationPage meta={meta} runs={runs} selected={hashSuite} onSelect={(id) => go("ablation", id)} onRun={onRun} jobActive={jobActive} />
+      )}
       {route === "compare" && <ComparePage suite={suite?.id === selectedId ? suite : null} />}
-      {route === "runs" && <RunsPage runs={runs} onOpenSuite={(id) => go("benchmark", id)} />}
+      {route === "runs" && <RunsPage runs={runs} onOpenSuite={(id) => go(runs.find((r) => r.id === id)?.kind === "ablation" ? "ablation" : "benchmark", id)} />}
       {route === "live" && <LiveArenaPage />}
     </div>
   );

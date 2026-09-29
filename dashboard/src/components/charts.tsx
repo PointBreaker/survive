@@ -8,7 +8,7 @@ const AXIS = "var(--text-3)";
 const GRID = "var(--grid)";
 
 /** Draw in real pixels: the SVG viewBox follows the container width. */
-function useWidth(ref: RefObject<HTMLDivElement>, fallback = 480): number {
+export function useWidth(ref: RefObject<HTMLDivElement>, fallback = 480): number {
   const [w, setW] = useState(fallback);
   useEffect(() => {
     const el = ref.current;

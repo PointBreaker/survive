@@ -62,6 +62,8 @@ arena/
   physics.py              pure functions: thrust→accel→velocity→position, bounce, collision
   environment.py          world state, spawning, scoring, observation building
   observation.py          PUBLIC interface: Observation, ArenaInfo, FORBIDDEN_KEYS
+  observation_views.py    observation modes raw / relative / physics (pure functions of one snapshot)
+  lockstep.py             lockstep timing (world waits for answers) + counterfactual takeover branches
   runner.py               closed loop: decision slots, async latency accounting
   recorder.py             JSONL run logs      replay.py   deterministic re-simulation
   app.py                  desktop console: one page (parameters · arena · inspector), live + replay
@@ -85,6 +87,10 @@ benchmark/
   adaptive.py             staircase search for the failure frontier
   remote_validation.py    remote (real latency) vs simulated latency, paired per seed
   suite.py                controllers x swept level x paired seeds -> complete frontier artifact
+                          (--timing lockstep, --param decision_delay_ms, --observation-mode)
+  ablation.py             observation ablation on reference-qualified (operationally solvable) seeds
+  snapshot.py             matched snapshot inspector (forensics, never a score)
+  shadow.py takeover.py   shadow runs + takeover-branch decision scoring
 arena/dashboard_api.py    read-only JSON API over runs/ (+ serves dashboard/dist)
 dashboard/                React + TypeScript + Vite + Recharts web dashboard
 tests/                    physics, collision, observation, determinism, isolation, async, headless
@@ -151,6 +157,55 @@ Integrity:
 * Aggregates and thresholds come from `benchmark.metrics`.
 * `benchmark/suite.py` only orchestrates the existing `run_episodes`.
 * Environment, physics, observation, runner and controllers were not changed.
+
+## Observation ablation: where does a controller fail?
+
+"It crashed" is not an explanation. The ablation asks at which layer a decision
+model fails, without helping it and without changing the world:
+
+| mode | what the controller gets | what it must still do itself |
+|---|---|---|
+| `raw` (default) | the canonical observation, unchanged | geometry, prediction, policy |
+| `relative` | + exact ego-centric transforms: `dx, dy, distance` to the target; `dx, dy, dvx, dvy, distance, gap, relative_speed` per obstacle; `player.wall_distance` | prediction, policy |
+| `physics` | + straight-line closest approach per obstacle and the target: `t* = clamp(-(r·v)/(v·v), 0, H)`, `closest_approach_distance = abs(r + v t*)`, `closest_approach_gap`; `H = prediction_horizon_s = 3` | policy |
+
+Environment, physics, collision and actions are identical in every mode. A view is a
+pure function of one snapshot (`arena/observation_views.py`): no simulator, RNG, spawn
+schedule or future state, no ordering by distance, and no judgement words (safe, danger,
+risk, avoid, recommend, best, …: enforced by tests). Jev gets formula-only definitions of
+the extra fields; in `raw` mode its request is byte-identical to before.
+`--observation-mode` works for every CLI (default `raw`) and is recorded in the artifacts.
+
+**Operationally solvable seeds.** A solution that exists in principle does not mean one exists
+with 200 ms latency, 10 Hz and 9 discrete actions. A seed qualifies only if a reference
+controller (SimpleAvoid: a *feasibility baseline*, not an oracle) succeeds on it (in every one of
+`--reference-repeats`) under the same config, world speed, decision Hz, max inflight, action
+space, duration, observation mode and timing, **with matched latency**: a fixed simulated
+latency (`--match-latency 190`) or `auto` (the median of an unscored probe of the candidate's
+real latency). The candidate then runs on exactly those seeds. Outcomes are closed-loop only;
+reference actions are never ground truth and never reach the candidate.
+
+```bash
+python -m benchmark.ablation --controller jev --modes raw,relative,physics \
+    --episodes 30 --preset easy --world-speed 0.5 --reference simple_avoid --match-latency 190
+python -m benchmark.ablation --controller jev --modes raw --timing lockstep   # latency taken out
+python -m benchmark.snapshot runs/<run>/episodes/raw/candidate/episode_0003_seed3 --auto
+```
+
+The report and the dashboard's **Ablation** tab show per mode: qualified seeds, success
+(Wilson CI), survival, targets and *measured* latency (with a mismatch flag against the
+reference latency). They also show a paired **capability decomposition**: RAW → RELATIVE,
+RELATIVE → PHYSICS and PHYSICS → reference, as success-rate changes on the same seeds with
+counts of seeds gained and lost. Each cell of the paired-seed table opens a verified replay.
+**Inspect decision** rebuilds the exact snapshot the controller received (checked against
+logged observations), shows it in all three modes, and shows what SimpleAvoid and Greedy would
+answer next to the logged answer and confidence. That is for inspection, not grading.
+
+Reading it (the data decides, not the tool): a jump RAW → RELATIVE suggests sensitivity to the
+coordinate representation; RELATIVE → PHYSICS suggests sensitivity to explicit projection; a
+remaining gap to the reference suggests policy selection; a gap that closes under
+`--timing lockstep` points at latency. A controller that ignores the extra fields (Greedy,
+SimpleAvoid) shows identical results in all modes, which is a built-in sanity check.
 
 ## Desktop console (GUI)
 
@@ -391,8 +446,10 @@ world speed D50 ≈ 3.0× · added latency D50 ≈ 108 ms · obstacle count D50 
 * In real-time UI mode, a threaded controller's answer is noticed at the next
   frame (up to ~16 ms of extra measured latency). Headless is the measurement
   mode.
-* No oracle yet, so some high-difficulty episodes may be unwinnable.
-  Generation only rules out obviously unfair starts.
+* No oracle. "Operationally solvable" means a reference controller completed the
+  seed; seeds it fails may still be solvable, and a stronger reference (ORCA, MPC)
+  would qualify more. Latency matching is a fixed simulated delay (no jitter);
+  replaying a candidate's real latency trace is not implemented yet.
 * The fake server holds one session per `/reset`. It's a test double, not a
   production server.
 * Obstacles are straight-line and bounce-only, with no obstacle-obstacle

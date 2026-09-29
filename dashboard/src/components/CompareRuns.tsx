@@ -161,7 +161,7 @@ function ArenaPanel({ style, replay, tick }: { style: SeriesStyle; replay: Repla
   );
 }
 
-function ArenaCanvas({ replay, tick, color }: { replay: Replay; tick: number; color: string }) {
+export function ArenaCanvas({ replay, tick, color }: { replay: Replay; tick: number; color: string }) {
   const ref = useRef<HTMLCanvasElement>(null);
   const [w, setW] = useState(600);
   const aspect = replay.arena.height / replay.arena.width;

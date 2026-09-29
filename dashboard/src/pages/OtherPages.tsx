@@ -46,7 +46,7 @@ export function RunsPage({ runs, onOpenSuite }: { runs: RunInfo[]; onOpenSuite: 
                 </thead>
                 <tbody>
                   {runs.map((r) => (
-                    <tr key={r.id} className={r.kind === "suite" ? "clickable" : ""} onClick={() => r.kind === "suite" && onOpenSuite(r.id)}>
+                    <tr key={r.id} className={r.kind === "suite" || r.kind === "ablation" ? "clickable" : ""} onClick={() => (r.kind === "suite" || r.kind === "ablation") && onOpenSuite(r.id)}>
                       <td className="mono">{r.id}</td>
                       <td><span className="kind">{r.kind}</span></td>
                       <td>{(r.controllers ?? []).filter(Boolean).map((c) => controllerLabel(String(c))).join(", ") || "–"}</td>
@@ -75,6 +75,8 @@ function details(r: RunInfo): string {
       return `single-controller ${r.kind} over ${paramInfo(r.param ?? "").short} (aggregates only)`;
     case "episode":
       return `seed ${r.seed} · ${r.reason ? reasonLabel(r.reason) : "unfinished"} · ${fmtS(r.survival_time)} · ${r.targets ?? 0} targets`;
+    case "ablation":
+      return `${(r.modes ?? []).join(" / ")} · reference ${r.reference} · ${r.timing} · ${r.episodes} seeds · ${r.status}`;
     default:
       return r.title;
   }

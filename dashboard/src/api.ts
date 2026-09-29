@@ -91,7 +91,11 @@ export interface SuiteDetail {
 
 export interface RunInfo {
   id: string;
-  kind: "suite" | "batch" | "sweep" | "adaptive" | "episode" | "remote_validation";
+  kind: "suite" | "batch" | "sweep" | "adaptive" | "episode" | "remote_validation" | "ablation" | "shadow";
+  modes?: string[];
+  reference?: string;
+  timing?: string;
+  experiment_type?: string;
   title: string;
   mtime: number;
   param?: string;
@@ -117,9 +121,108 @@ export interface SuiteProgress {
   current: { controller: string; level: number } | null;
 }
 
+export interface AblationAggregate {
+  episodes: number;
+  successes: number;
+  success_rate: number;
+  success_rate_ci95: [number, number];
+  mean_targets: number | null;
+  mean_survival_time: number | null;
+  mean_latency_ms: number | null;
+  failure_reasons: Record<string, number>;
+}
+
+export interface AblationMode {
+  candidate_seeds: number;
+  qualified_seeds: number[];
+  qualified: number;
+  reference_all: AblationAggregate | null;
+  reference_qualified: AblationAggregate | null;
+  candidate: AblationAggregate | null;
+  candidate_unqualified: AblationAggregate | null;
+  candidate_latency: { p50_ms: number | null; mean_ms: number | null };
+  reference_latency: { p50_ms: number | null; mean_ms: number | null };
+  latency_match: { reference_ms: number; candidate_p50_ms: number | null; ratio: number | null; within_tolerance: boolean | null };
+  pairs: { seed: number; reference: string[]; candidate: string | null; candidate_survival: number | null; candidate_targets: number | null }[];
+}
+
+export interface DecompositionStep {
+  from: string;
+  to: string;
+  seeds: number;
+  from_success: number;
+  to_success: number;
+  delta_pp: number | null;
+  gained: number;
+  lost: number;
+}
+
+export interface AblationManifest {
+  kind: "ablation";
+  experiment_type: "observation_ablation" | "paired_solvable";
+  status: string;
+  created: string;
+  controller: string;
+  reference_controller: string;
+  reference_repeats: number;
+  modes: string[];
+  timing: "realtime" | "lockstep";
+  interval_s?: number;
+  candidate_seeds: number[];
+  config: Record<string, number | null> & { world_speed_scale: number; decision_hz: number; max_inflight: number; max_duration: number; obstacle_count: number };
+  latency: { reference_ms: number; reference_kind: string; how: string; candidate_added_ms: number; probe_ms: number[]; jitter_matched: boolean };
+  progress?: { stage: string; mode: string | null; done: number; total: number; cand_done?: number; cand_total?: number };
+  argv: string[];
+}
+
+export interface AblationRow {
+  role: "reference" | "candidate";
+  mode: string;
+  seed: number;
+  repeat: number;
+  success: boolean;
+  reason: string;
+  survival_time: number;
+  targets_collected: number;
+  p50_latency_ms: number | null;
+  episode_dir: string;
+  qualified?: boolean;
+}
+
+export interface AblationDetail {
+  id: string;
+  manifest: AblationManifest;
+  summary: { modes: Record<string, AblationMode>; decomposition: DecompositionStep[] } | null;
+  episodes: AblationRow[];
+}
+
+export interface RequestInfo {
+  tick: number;
+  applied_tick: number | null;
+  action: string | null;
+  latency_ms: number | null;
+  confidence?: number | null;
+  probabilities?: Record<string, number> | null;
+  status?: string;
+}
+
+export interface Inspection {
+  episode: string;
+  controller: string;
+  seed: number;
+  tick: number;
+  t: number;
+  observation_mode: string;
+  logged: RequestInfo | null;
+  views: Record<string, Record<string, unknown>>;
+  answers: Record<string, { action: string | null; primed: boolean; confidence?: number; error?: string }>;
+  note: string;
+}
+
 export type JobStatus = "running" | "cancelling" | "succeeded" | "failed" | "cancelled";
 export interface Job {
   id: string;
+  kind?: "suite" | "shadow" | "ablation";
   status: JobStatus;
   suite_id: string | null;
   suite_status: string | null;
@@ -130,6 +233,20 @@ export interface Job {
   elapsed_s: number;
   returncode: number | null;
   log_tail: string[];
+}
+
+export interface AblationJobSpec {
+  kind: "ablation";
+  controller: string;
+  reference: string;
+  modes: string[];
+  episodes: number;
+  preset: string;
+  timing: "realtime" | "lockstep";
+  match_latency?: number | "auto";
+  world_speed?: number;
+  interval?: number;
+  seed?: number;
 }
 
 export interface JobSpec {
@@ -238,6 +355,13 @@ export const api = {
     ),
   replay: (id: string, episode: string) => get<Replay>(`/api/suites/${q(id)}/replay?episode=${q(episode)}`),
   jobs: () => get<Job[]>("/api/jobs"),
-  startJob: (spec: JobSpec) => post<Job>("/api/jobs", spec),
+  ablations: () => get<RunInfo[]>("/api/ablations"),
+  ablation: (id: string) => get<AblationDetail>(`/api/ablations/${q(id)}`),
+  runReplay: (id: string, episode: string) => get<Replay>(`/api/runs/${q(id)}/replay?episode=${q(episode)}`),
+  snapshots: (id: string, episode: string) =>
+    get<{ episode: string; requests: RequestInfo[]; key_ticks: number[] }>(`/api/runs/${q(id)}/snapshots?episode=${q(episode)}`),
+  inspect: (id: string, episode: string, tick: number, mode: string) =>
+    get<Inspection>(`/api/runs/${q(id)}/inspect?episode=${q(episode)}&tick=${tick}&mode=${q(mode)}`),
+  startJob: (spec: JobSpec | AblationJobSpec) => post<Job>("/api/jobs", spec),
   cancelJob: (id: string) => post<Job>(`/api/jobs/${q(id)}/cancel`, {}),
 };

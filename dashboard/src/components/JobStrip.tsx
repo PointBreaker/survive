@@ -27,7 +27,7 @@ export function JobStrip({ job, viewing, onView, onCancel, onDismiss }: {
 }) {
   const [showLog, setShowLog] = useState(job.status === "failed");
   const st = STATE[job.status];
-  const p = job.progress;
+  const p = job.kind && job.kind !== "suite" ? null : job.progress;  // other job kinds report on their own page
   const frac = p && p.episodes_total ? p.episodes_done / p.episodes_total : 0;
   const active = job.status === "running" || job.status === "cancelling";
   // Rough ETA from average time per finished episode (episodes differ in length).
@@ -48,7 +48,7 @@ export function JobStrip({ job, viewing, onView, onCancel, onDismiss }: {
               {p.current && active && <span>now: <b>{controllerLabel(p.current.controller)}</b> @ {p.current.level}</span>}
             </>
           ) : (
-            <span>starting…</span>
+            <span>{job.kind && job.kind !== "suite" ? `${job.kind} run` : "starting…"}</span>
           )}
           <span>elapsed <b>{fmtDur(job.elapsed_s)}</b></span>
           {eta !== null && <span>≈ {fmtDur(eta)} left</span>}
