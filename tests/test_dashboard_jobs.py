@@ -179,3 +179,22 @@ def test_build_argv_lockstep_and_shadow():
     assert s[:4] == ["--driver", "explorer", "--shadows", "simple_avoid,random"] and "--branch-workers" in s
     with pytest.raises(JobError):
         build_shadow_argv({"shadows": ["jev"]}, BENCH, False)
+
+
+def test_ablation_job_argv_and_run(tmp_path):
+    from arena.dashboard_jobs import build_ablation_argv
+
+    a = build_ablation_argv({"controller": "greedy+100ms", "episodes": 3, "match_latency": 100}, BENCH, False)
+    assert a[:6] == ["--controller", "greedy+100ms", "--reference", "simple_avoid", "--modes", "raw,relative,physics"]
+    assert a[a.index("--match-latency") + 1] == "100"
+    for bad in ({"controller": "jev"}, {"controller": "greedy", "reference": "jev"},
+                {"controller": "greedy", "modes": ["raw", "x"]}, {"controller": "greedy", "match_latency": "; ls"}):
+        with pytest.raises(JobError):
+            build_ablation_argv(bad, BENCH, False)
+    jm = JobManager(tmp_path)
+    j = jm.start({"kind": "ablation", "controller": "greedy+50ms", "episodes": 2, "max_duration": 3,
+                  "match_latency": 50, "modes": ["raw", "physics"]}, BENCH, False)
+    assert j["command"].startswith("python -m benchmark.ablation")
+    done = wait(lambda: (lambda d: d if d["status"] != "running" else None)(jm.get(j["id"])))
+    assert done["status"] == "succeeded", done["log_tail"]
+    assert done["suite_status"] == "complete" and (tmp_path / done["suite_id"] / "summary.json").is_file()

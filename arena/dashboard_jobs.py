@@ -171,6 +171,52 @@ def build_shadow_argv(spec: dict[str, Any], benchmarkable: list[str], jev_token:
     return argv
 
 
+def build_ablation_argv(spec: dict[str, Any], benchmarkable: list[str], jev_token: bool) -> list[str]:
+    """Validate an observation-ablation request and turn it into ``benchmark.ablation`` arguments."""
+    c = str(spec.get("controller", ""))
+    m = SPEC_RE.match(c)
+    if not m or m.group(1) not in benchmarkable:
+        raise JobError(400, f"unknown controller {c!r}")
+    if m.group(1) == "jev" and not jev_token:
+        raise JobError(400, "Jev needs OPENROUTER_API_KEY (or TYPESAFE_API_KEY) in .env")
+    ref = str(spec.get("reference", "simple_avoid"))
+    if ref not in benchmarkable or ref == "jev":
+        raise JobError(400, f"reference must be a local controller, got {ref!r}")
+    modes = spec.get("modes", ["raw", "relative", "physics"])
+    if not isinstance(modes, list) or not modes or any(x not in ("raw", "relative", "physics") for x in modes):
+        raise JobError(400, "modes: choose from raw, relative, physics")
+    timing = spec.get("timing", "realtime")
+    if timing not in ("realtime", "lockstep"):
+        raise JobError(400, "timing must be realtime or lockstep")
+    preset = spec.get("preset", "easy")
+    if preset not in PRESETS:
+        raise JobError(400, f"preset must be one of {sorted(PRESETS)}")
+    episodes = _num(spec, "episodes", 1, 500, integer=True, default=30)
+    argv = ["--controller", c, "--reference", ref, "--modes", ",".join(dict.fromkeys(modes)),
+            "--episodes", str(episodes), "--preset", preset, "--timing", timing]
+    if timing == "realtime":
+        ml = spec.get("match_latency", "auto")
+        if ml != "auto":
+            ml = f"{_num({'match_latency': ml}, 'match_latency', 0, 10000):g}"
+        argv += ["--match-latency", ml]
+    else:
+        argv += ["--interval", f"{_num(spec, 'interval', 0.02, 2, default=0.1):g}"]
+    for key, flag, a, b, integer in [("seed", "--seed", 0, 10**9, True), ("world_speed", "--world-speed", 0.05, 64, False),
+                                     ("reference_repeats", "--reference-repeats", 1, 5, True),
+                                     ("obstacles", "--obstacles", 0, 400, True),
+                                     ("max_duration", "--max-duration", 1, 600, False),
+                                     ("decision_hz", "--decision-hz", 0.1, 120, False),
+                                     ("max_inflight", "--max-inflight", 1, 8, True)]:
+        if timing == "lockstep" and key in ("world_speed", "decision_hz", "max_inflight"):
+            continue
+        v = _num(spec, key, a, b, integer)
+        if v is not None:
+            argv += [flag, f"{v:g}" if isinstance(v, float) else str(v)]
+    if spec.get("also_unqualified"):
+        argv.append("--also-unqualified")
+    return argv
+
+
 @dataclass
 class Job:
     id: str
@@ -179,7 +225,7 @@ class Job:
     log_path: Path
     started: float
     proc: subprocess.Popen
-    kind: str = "suite"  # or "shadow"
+    kind: str = "suite"  # "suite" | "shadow" | "ablation"
     ended: Optional[float] = None
     cancel_requested: bool = False
     tail: deque = field(default_factory=lambda: deque(maxlen=60))
@@ -237,15 +283,18 @@ class JobManager:
 
     def start(self, spec: dict[str, Any], benchmarkable: list[str], jev_token: bool) -> dict[str, Any]:
         kind = spec.get("kind", "suite")
-        if kind not in ("suite", "shadow"):
-            raise JobError(400, "kind must be suite or shadow")
-        argv = (build_shadow_argv if kind == "shadow" else build_argv)(spec, benchmarkable, jev_token)
+        builders = {"suite": build_argv, "shadow": build_shadow_argv, "ablation": build_ablation_argv}
+        if kind not in builders:
+            raise JobError(400, f"kind must be one of {sorted(builders)}")
+        argv = builders[kind](spec, benchmarkable, jev_token)
         with self._lock:
             active = self._active()
             if active:
                 raise JobError(409, "a benchmark is already running; cancel it or wait (parallel suites would distort measured latency)")
             if kind == "shadow":
                 run_dir = new_run_dir(self.root, "shadow", argv[argv.index("--driver") + 1])
+            elif kind == "ablation":
+                run_dir = new_run_dir(self.root, "ablation", SPEC_RE.match(argv[1]).group(1))
             else:
                 run_dir = new_run_dir(self.root, "suite", argv[argv.index("--param") + 1])
             logs = self.root / ".jobs"

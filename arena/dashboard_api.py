@@ -21,7 +21,12 @@ Endpoints (JSON):
     GET /api/suites/<id>/episodes?controller=<spec>&level=<level>
     GET /api/suites/<id>/compare?level=<level>&seed=<seed>
     GET /api/suites/<id>/replay?episode=<relative episode dir>
-    GET /api/shadows
+    GET /api/ablations
+    GET /api/ablations/<id>                                 manifest + summary (+ per-episode rows)
+    GET /api/runs/<id>/replay?episode=<relative dir>        verified replay of any episode in a run
+    GET /api/runs/<id>/snapshots?episode=<relative dir>     the controller's decision requests
+    GET /api/runs/<id>/inspect?episode=<dir>&tick=<k>[&mode=raw]
+                     matched snapshot: the rebuilt observation in all modes + local controllers' answers
     GET /api/shadows/<id>                                   manifest + takeover scores + episodes
     GET /api/shadows/<id>/branches?episode=<name>           branch outcomes (no paths)
     GET /api/shadows/<id>/branch?episode=<name>&tick=<k>    one branch with paths + obstacle frames
@@ -106,6 +111,13 @@ def classify_run(d: Path) -> Optional[dict[str, Any]]:
                 "levels": m["levels"], "controllers": m["controllers"], "status": effective_status(m),
                 "progress": m.get("progress"),
                 "episodes_per_point": m.get("episodes_per_point"), "created": m.get("created")}
+    if (d / "ablation.json").is_file():
+        m = _read_json(d / "ablation.json")
+        return {**base, "kind": "ablation", "title": f"ablation · {m['controller']}", "controllers": [m["controller"]],
+                "reference": m["reference_controller"], "modes": m["modes"], "timing": m["timing"],
+                "experiment_type": m["experiment_type"], "status": effective_status(m),
+                "progress": m.get("progress"), "created": m.get("created"),
+                "episodes": len(m.get("candidate_seeds", []))}
     if (d / "shadow.json").is_file():
         m = _read_json(d / "shadow.json")
         return {**base, "kind": "shadow", "title": f"shadow · {m['driver']}", "driver": m["driver"],
@@ -407,6 +419,62 @@ class DashboardAPI:
         stamp = (ep / "result.json").stat().st_mtime
         return self._cached(f"replay:{ep}", stamp, lambda: replay_episode(ep))
 
+    # ----------------------------------------------------------- ablations
+    def ablations(self) -> list[dict[str, Any]]:
+        return [r for r in self.runs() if r["kind"] == "ablation"]
+
+    def ablation(self, run_id: str) -> dict[str, Any]:
+        d = self._run_dir(run_id)
+        if not (d / "ablation.json").is_file():
+            raise ApiError(404, f"{run_id!r} is not an ablation run")
+        m = _read_json(d / "ablation.json")
+        m["status"] = effective_status(m)
+        summary = None
+        if (d / "summary.json").is_file():
+            try:
+                summary = _read_json(d / "summary.json")
+            except ValueError:
+                summary = None
+        keep = ("role", "mode", "seed", "repeat", "success", "reason", "survival_time", "targets_collected",
+                "p50_latency_ms", "mean_decision_latency_ms", "episode_dir", "qualified", "controller_spec")
+        rows = [{k: r.get(k) for k in keep} for r in _read_jsonl(d / "results.jsonl")] \
+            if (d / "results.jsonl").is_file() else []
+        return {"id": d.name, "manifest": m, "summary": summary, "episodes": rows}
+
+    def _episode_in(self, run_id: str, episode: str) -> Path:
+        d = self._run_dir(run_id)
+        ep = (d / unquote(episode)).resolve()
+        if d not in ep.parents or not (ep / "result.json").is_file() or not (ep / "config.json").is_file():
+            raise ApiError(404, "episode not found in this run")
+        return ep
+
+    def run_replay(self, run_id: str, episode: str) -> dict[str, Any]:
+        ep = self._episode_in(run_id, episode)
+        return self._cached(f"replay:{ep}", (ep / "result.json").stat().st_mtime, lambda: replay_episode(ep))
+
+    def snapshots(self, run_id: str, episode: str) -> dict[str, Any]:
+        from benchmark.snapshot import key_snapshots, requests
+
+        ep = self._episode_in(run_id, episode)
+        return {"episode": episode, "requests": requests(ep), "key_ticks": key_snapshots(ep)}
+
+    def inspect(self, run_id: str, episode: str, tick: str, mode: str) -> dict[str, Any]:
+        from arena.observation_views import MODES
+        from benchmark.snapshot import LOCAL_CONTROLLERS, inspect
+
+        ep = self._episode_in(run_id, episode)
+        if mode not in MODES:
+            raise ApiError(400, f"mode must be one of {MODES}")
+        try:
+            k = int(float(tick))
+        except ValueError:
+            raise ApiError(400, "tick must be a number")
+        try:
+            # local controllers only: the dashboard never makes paid API calls; the logged answer is shown instead
+            return inspect(ep, k, LOCAL_CONTROLLERS, mode)
+        except ValueError as e:
+            raise ApiError(400, str(e))
+
     # ------------------------------------------------------------ shadows
     def _shadow_dir(self, run_id: str) -> Path:
         d = self._run_dir(run_id)
@@ -478,6 +546,20 @@ class DashboardAPI:
             return self.suites()
         if len(parts) == 2 and parts[0] == "suites":
             return self.suite(parts[1])
+        if parts == ["ablations"]:
+            return self.ablations()
+        if len(parts) == 2 and parts[0] == "ablations":
+            return self.ablation(parts[1])
+        if len(parts) == 3 and parts[0] == "runs" and parts[2] in ("replay", "snapshots", "inspect"):
+            if "episode" not in q:
+                raise ApiError(400, "episode is required")
+            if parts[2] == "replay":
+                return self.run_replay(parts[1], q["episode"])
+            if parts[2] == "snapshots":
+                return self.snapshots(parts[1], q["episode"])
+            if "tick" not in q:
+                raise ApiError(400, "tick is required")
+            return self.inspect(parts[1], q["episode"], q["tick"], q.get("mode", "raw"))
         if parts == ["shadows"]:
             return self.shadows()
         if len(parts) == 2 and parts[0] == "shadows":
