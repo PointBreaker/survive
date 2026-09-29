@@ -90,6 +90,7 @@ benchmark/
                           (--timing lockstep, --param decision_delay_ms, --observation-mode)
   ablation.py             observation ablation on reference-qualified (operationally solvable) seeds
   snapshot.py             matched snapshot inspector (forensics, never a score)
+arena/live_view.py        live viewer process for headless experiments (receive-only)
   shadow.py takeover.py   shadow runs + takeover-branch decision scoring
 arena/dashboard_api.py    read-only JSON API over runs/ (+ serves dashboard/dist)
 dashboard/                React + TypeScript + Vite + Recharts web dashboard
@@ -191,6 +192,26 @@ python -m benchmark.ablation --controller jev --modes raw,relative,physics \
 python -m benchmark.ablation --controller jev --modes raw --timing lockstep   # latency taken out
 python -m benchmark.snapshot runs/<run>/episodes/raw/candidate/episode_0003_seed3 --auto
 ```
+
+**Watching a run (default).** When a display is available, the ablation opens a live viewer.
+On the left is the candidate playing the current seed. On the right is the reference's recorded
+run on the same seed, replayed at the same moment. On the side are requests and responses (action,
+confidence, latency, errors in red), a live scoreboard and an ETA. The viewer is a separate process
+that only receives messages, so drawing never slows the control loop (the environment hook is
+read-only and bit-identical, tested). Closing the window or pressing Q stops the run cleanly; continue
+it with `--resume`. `--no-watch` runs without the viewer. Before anything is spent the CLI prints a
+plan and asks to start (`-y` skips the question). The plan gives how many candidate episodes will run,
+the time (at most, and typical from earlier episodes) and the number of API requests. `--limit N` runs
+only N episodes per mode now, e.g. to watch a few before committing to the full run:
+
+```bash
+python -m benchmark.ablation --resume runs/<run> --limit 2   # ~6 episodes, a few minutes, watched
+python -m benchmark.ablation --resume runs/<run>             # the rest
+```
+
+The reference's simulated latency is centred in its tick (a real latency L plus compute takes effect
+`floor(L/tick) + 1` ticks later). A value on a tick boundary would otherwise let microseconds of
+host jitter change the reference's outcome.
 
 **Validity.** A failed decision leaves the previous action running, so an episode full of
 API errors measures the service, not the controller. A candidate episode with more than

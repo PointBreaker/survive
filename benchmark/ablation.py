@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import signal
 import sys
@@ -61,15 +62,23 @@ from arena.observation_views import MODES
 from arena.recorder import JsonlRecorder, new_run_dir
 from arena.stats import mean, percentile
 from benchmark.metrics import aggregate
-from benchmark.runner import run_episode
 from benchmark.suite import parse_spec
 
 VERSION = 1
+TICK_MS = 1000.0 / 60.0  # one physics tick of controller (wall-clock) time
 LATENCY_MATCH_TOLERANCE = (0.75, 1.333)  # candidate p50 / reference latency outside this is flagged
 
 
 class Cancelled(Exception):
     pass
+
+
+MODE_BLURB = {"raw": "canonical state only", "relative": "+ ego-relative coordinates",
+              "physics": "+ linear closest-approach projection"}
+
+
+def fmt_speed(cfg, lockstep: bool) -> str:
+    return "lockstep" if lockstep else f"{cfg.world_speed_scale:g}x world speed · {cfg.decision_hz:g} Hz"
 
 
 class Aborted(Exception):
@@ -117,18 +126,33 @@ def probe_latency_ms(factory: Callable, config, seed: int, n: int, timeout_s: fl
 
 
 def run_one(factory: Callable, name: str, config, seed: int, ep_dir: Path, timing: str,
-            interval_s: float, delay_s: float) -> dict[str, Any]:
-    rec = JsonlRecorder(ep_dir, record_observations=False)
-    if timing == "lockstep":
-        from arena.lockstep import LockstepRunner
+            interval_s: float, delay_s: float, view=None) -> dict[str, Any]:
+    """One episode in the unchanged measurement runners. With a live ``view`` the environment is an
+    ObservedEnvironment (identical dynamics, read-only hook) and decision events are also forwarded."""
+    from arena.runner import EpisodeRunner
 
-        ctrl = factory()
-        try:
-            return LockstepRunner(Environment(config, seed), (name, ctrl), None, interval_s, delay_s, rec).run()
-        finally:
-            ctrl.close()
-            rec.close()
-    return run_episode(factory, config, seed, recorder=rec)
+    rec = JsonlRecorder(ep_dir, record_observations=False)
+    if view is not None:
+        from arena.live_view import ObservedEnvironment, TeeRecorder
+
+        env = ObservedEnvironment(config, seed, view)
+        rec = TeeRecorder(rec, view)
+    else:
+        env = Environment(config, seed)
+    ctrl = factory()
+    t0 = time.perf_counter()
+    try:
+        if timing == "lockstep":
+            from arena.lockstep import LockstepRunner
+
+            r = LockstepRunner(env, (name, ctrl), None, interval_s, delay_s, rec).run()
+        else:
+            r = EpisodeRunner(env, ctrl, recorder=rec).run()
+    finally:
+        ctrl.close()
+        rec.close()
+    r["wall_s"] = time.perf_counter() - t0
+    return r
 
 
 def _slim(r: dict[str, Any]) -> dict[str, Any]:
@@ -276,6 +300,70 @@ def build_summary(m: dict[str, Any], rows: list[dict[str, Any]], run_dir: Option
             "valid": all(not v["invalid_seeds"] and v["evaluated"] == v["qualified"] for v in modes_out.values())}
 
 
+def estimate(rows, modes, seeds, cfg, repeats, lockstep, limit, max_fail, run_dir, probe_ms) -> dict[str, Any]:
+    """What this invocation will run, and roughly how long it takes (before anything is spent)."""
+    rows = latest(rows)
+    todo = 0
+    exact = True
+    for mode in modes:
+        refs = {(r["seed"], r.get("repeat", 0)): r for r in rows if r["role"] == "reference" and r["mode"] == mode}
+        n = 0
+        for seed in seeds:
+            rs = [refs.get((seed, k)) for k in range(repeats)]
+            if any(x is None for x in rs):
+                exact = False  # qualification not known yet: count as if it qualifies (upper bound)
+            elif not all(x["success"] for x in rs):
+                continue
+            c = next((r for r in reversed(rows) if r["role"] == "candidate" and r["mode"] == mode and r["seed"] == seed), None)
+            if c is not None and c.get("valid", episode_validity(c, run_dir, max_fail)["valid"]):
+                continue
+            n += 1
+        todo += min(n, limit) if limit is not None else n
+    scale = 1.0 if lockstep else cfg.world_speed_scale
+    max_wall = cfg.max_duration / scale
+    prior = [r for r in rows if r["role"] == "candidate" and r.get("valid", True) and r.get("failed_decisions", 0) == 0]
+    walls = [r["wall_s"] if r.get("wall_s") else r["survival_time"] / scale for r in prior]
+    typical = mean(walls) if walls else None
+    lat = percentile(probe_ms, 50) if probe_ms else None
+    rate = min(cfg.decision_hz, 1000.0 / lat * cfg.max_inflight) if (lat and not lockstep) else cfg.decision_hz
+    if lockstep and lat:
+        rate = 1000.0 / lat
+    return {"episodes": todo, "exact": exact, "typical_wall_s": typical, "max_wall_s": max_wall,
+            "typical_total_s": None if typical is None else typical * todo, "max_total_s": max_wall * todo,
+            "requests_per_s": rate, "latency_ms": lat, "from_prior": len(walls)}
+
+
+def print_plan(p: dict[str, Any], controller: str) -> None:
+    from arena.live_view import _dur
+
+    n = p["episodes"]
+    print(f"\nPlan: {'' if p['exact'] else 'up to '}{n} {controller} episode(s) (reference episodes are fast and not counted)")
+    if n:
+        typ = p["typical_total_s"]
+        print(f"  time: at most {_dur(p['max_total_s'])} (every episode survives {_dur(p['max_wall_s'])})"
+              + (f"; about {_dur(typ)} at the {_dur(p['typical_wall_s'])} per episode seen in {p['from_prior']} earlier episodes"
+                 if typ else ""))
+        lo = p["requests_per_s"] * (p["typical_total_s"] or p["max_total_s"])
+        print(f"  requests: about {lo:,.0f}" + (f" (at {p['latency_ms']:.0f} ms each)" if p["latency_ms"] else "")
+              + (", at most " + f"{p['requests_per_s'] * p['max_total_s']:,.0f}" if p["typical_total_s"] else ""))
+        print("  tip: --limit 2 runs two episodes per mode first; continue with --resume <run dir>")
+
+
+def _board(m: dict[str, Any], rows: list[dict[str, Any]], qualified: dict[str, list[int]], limit) -> list[dict[str, Any]]:
+    board = []
+    lr = latest(rows)
+    for mode in m["modes"]:
+        c = [r for r in lr if r["role"] == "candidate" and r["mode"] == mode]
+        valid = [r for r in c if r.get("valid")]
+        q = qualified.get(mode)
+        board.append({"label": mode.upper(), "done": len(valid), "total": len(q) if q is not None else len(m["candidate_seeds"]),
+                      "success": sum(1 for r in valid if r["success"]),
+                      "collision": sum(1 for r in valid if r["reason"] == "collision"),
+                      "timeout": sum(1 for r in valid if r["reason"] == "target_timeout"),
+                      "invalid": sum(1 for r in c if not r.get("valid"))})
+    return board
+
+
 def _read_rows(run_dir: Path) -> list[dict[str, Any]]:
     p = run_dir / "results.jsonl"
     return [json.loads(l) for l in p.read_text().splitlines() if l.strip()] if p.is_file() else []
@@ -312,6 +400,15 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="a candidate episode with a larger share of failed decisions is invalid (excluded)")
     ap.add_argument("--resume", metavar="RUN_DIR", default=None,
                     help="continue a run: same manifest; runs missing episodes and re-runs invalid candidate ones")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="run at most N candidate episodes per mode now (continue the rest later with --resume)")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--watch", dest="watch", action="store_true", default=None,
+                   help="open the live viewer (default when a display is available)")
+    g.add_argument("--no-watch", dest="watch", action="store_false", help="run without the live viewer")
+    ap.add_argument("--pause", type=float, default=1.5,
+                    help="with the viewer: seconds to show each candidate outcome before the next episode")
+    ap.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation before starting")
     ap.add_argument("--rescore", metavar="RUN_DIR", default=None, help="only rebuild summary.json of a run")
     ap.add_argument("--out", default="runs")
     ap.add_argument("--run-dir", default=None)
@@ -380,6 +477,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not probe:
         ap.error("the candidate answered none of the preflight requests"
                  + (f": {probe_errors[-1][:300]}" if probe_errors else ""))
+    plan = estimate(rows, modes, seeds, cfg, args.reference_repeats, lockstep, args.limit,
+                    m.get("max_failure_rate", args.max_failure_rate) if args.resume else args.max_failure_rate,
+                    Path(args.resume) if args.resume else None, probe)
+    print_plan(plan, args.controller)
+    if not args.yes and sys.stdin.isatty():
+        if input("Start? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("not started")
+            return 1
     if not args.resume:
         if lockstep:
             ref_ms, how = 0.0, "none (lockstep: latency costs no world time)"
@@ -394,6 +499,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             if ref_ms < 0:
                 ap.error("--match-latency must be >= 0")
             how = "fixed"
+        if not lockstep and ref_ms > 0:
+            # A decision takes effect ceil(L / tick) ticks later. A latency near a tick boundary would let
+            # microseconds of host jitter flip the delay by a tick and change the reference's outcome, so the
+            # simulated latency is centred in its tick: the tick count a real latency of L (plus compute) gets.
+            nominal = ref_ms
+            n_ticks = math.floor(nominal / TICK_MS + 1e-9) + 1  # what L plus any compute time yields
+            ref_ms = (n_ticks - 0.5) * TICK_MS
+            how += f"; {nominal:.1f} ms -> {n_ticks} ticks, simulated as {ref_ms:.1f} ms (centre of the tick)"
         out = Path(args.run_dir) if args.run_dir else new_run_dir(args.out, "ablation", cand_name)
         if args.run_dir and out.exists() and any(out.iterdir()):
             ap.error(f"--run-dir {out} is not empty")
@@ -427,6 +540,57 @@ def main(argv: Optional[list[str]] = None) -> int:
     t0 = time.perf_counter()
     say = (lambda *a: None) if args.quiet else (lambda *a: print(*a, flush=True))
     max_fail = m["max_failure_rate"]
+
+    # ---- live viewer (default when a display is available); it only receives messages
+    from arena.live_view import LiveView, StopRequested, display_available
+
+    watch = display_available() if args.watch is None else args.watch
+    view = None
+    if watch:
+        try:
+            view = LiveView(title=f"Decision Arena · ablation · {args.controller}")
+        except Exception as e:  # no window: the experiment itself is unaffected
+            say(f"(live viewer unavailable: {e})")
+    elif args.watch is None:
+        say("(no display found: running without the live viewer; see the dashboard's Ablation tab)")
+    qualified_by_mode: dict[str, list[int]] = {}
+    cand_walls: list[float] = []
+    ran_now = {md: 0 for md in modes}
+    ref_label = f"{ref_name}" + (f" @ {ref_ms:.0f} ms" if not lockstep else " (lockstep)")
+    tick_s = cfg.world_speed_scale / 60.0
+
+    def push_plan(stage_text: str, remaining: Optional[int] = None) -> None:
+        if view is None:
+            return
+        b = _board(m, rows, qualified_by_mode, args.limit)
+        done = sum(x["done"] + x["invalid"] for x in b)
+        total = sum(x["total"] for x in b)
+        avg = mean(cand_walls) if cand_walls else None
+        view.send({"type": "plan", "title": f"Observation ablation · {args.controller} vs {ref_label}",
+                   "stage_text": stage_text, "done": done, "total": total, "board": b,
+                   "eta_s": (avg * remaining) if (avg and remaining is not None) else None,
+                   "notes": [f"{cfg.obstacle_count} obstacles · {fmt_speed(cfg, lockstep)} · {len(seeds)} seeds",
+                             "only reference-qualified seeds are run for the candidate"]})
+
+    def start_episode(title: str, subtitle: str, color, reference: Optional[dict[str, Any]] = None,
+                      ref_title: str = "", ref_subtitle: str = "") -> None:
+        if view is not None:
+            view.send({"type": "episode_start", "config": cfg.to_dict(), "tick_s": tick_s, "title": title,
+                       "subtitle": subtitle, "color": color, "reference": reference, "ref_title": ref_title,
+                       "ref_subtitle": ref_subtitle})
+
+    def reference_replay(mode: str, seed: int) -> Optional[dict[str, Any]]:
+        r = next((x for x in reversed(rows) if x["role"] == "reference" and x["mode"] == mode
+                  and x["seed"] == seed and x.get("repeat", 0) == 0), None)
+        if r is None:
+            return None
+        try:
+            res = json.loads((out / r["episode_dir"] / "result.json").read_text())
+        except (OSError, ValueError):
+            return None
+        return {"config": cfg.to_dict(), "seed": seed, "action_changes": res["action_changes"], "ticks": res["ticks"],
+                "result": {"reason": res["reason"]}}
+
     try:
         with open(out / "results.jsonl", "a") as rf:
             def emit(row):
@@ -450,7 +614,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                         if r is None:
                             rel = Path("episodes") / mode / "reference" / (
                                 f"episode_{i:04d}_seed{seed}" + (f"_r{k}" if args.reference_repeats > 1 else ""))
-                            r = _slim(run_one(ref_f, ref_name, cfg, seed, out / rel, args.timing, args.interval, args.delay))
+                            push_plan(f"{mode.upper()} · qualifying seeds with {ref_label}: seed {seed} "
+                                      f"({i + 1}/{len(seeds)}) · fast-forward, simulated latency")
+                            start_episode(f"{ref_name} · {mode.upper()} · seed {seed}", "qualification run (fast-forward)",
+                                          (25, 158, 112))
+                            r = _slim(run_one(ref_f, ref_name, cfg, seed, out / rel, args.timing, args.interval, args.delay,
+                                              view))
                             r = {**r, "role": "reference", "mode": mode, "seed": seed, "repeat": k,
                                  "controller_spec": ref_name, "latency_config_ms": ref_ms, "episode_dir": str(rel)}
                             r.update(episode_validity(r, out, max_fail))
@@ -461,6 +630,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                         qualified.append(seed)
                     save()
                 say(f"[{mode}] reference {ref_name} @ {ref_ms:.0f} ms qualified {len(qualified)} / {len(seeds)} seeds")
+                qualified_by_mode[mode] = qualified
 
                 todo = seeds if args.also_unqualified else qualified
                 m["progress"].update(stage="candidate", mode=mode, cand_done=0, cand_total=len(todo))
@@ -471,11 +641,22 @@ def main(argv: Optional[list[str]] = None) -> int:
                     if prior is not None and prior.get("valid", episode_validity(prior, out, max_fail)["valid"]):
                         m["progress"]["cand_done"] += 1
                         continue
+                    if args.limit is not None and ran_now[mode] >= args.limit:
+                        continue  # left for a later --resume
+                    ran_now[mode] += 1
                     attempt = 0 if prior is None else prior.get("attempt", 0) + 1
                     i = seeds.index(seed)
+                    remaining = sum(1 for sd in todo if not (have("candidate", mode, sd) or {}).get("valid"))
+                    push_plan(f"{mode.upper()} · {args.controller} on seed {seed} · live", remaining)
+                    ref_replay = reference_replay(mode, seed)
+                    start_episode(f"{args.controller} · {mode.upper()} · seed {seed}",
+                                  f"live · {MODE_BLURB.get(mode, '')}", (57, 135, 229), ref_replay,
+                                  f"{ref_label} · same seed", "its recorded run, replayed at the same moment")
                     rel = Path("episodes") / mode / "candidate" / (
                         f"episode_{i:04d}_seed{seed}" + (f"_a{attempt}" if attempt else ""))
-                    r = _slim(run_one(cand_f, args.controller, cfg, seed, out / rel, args.timing, args.interval, args.delay))
+                    r = _slim(run_one(cand_f, args.controller, cfg, seed, out / rel, args.timing, args.interval, args.delay,
+                                      view))
+                    cand_walls.append(r["wall_s"])
                     r = {**r, "role": "candidate", "mode": mode, "seed": seed, "repeat": 0, "attempt": attempt,
                          "controller_spec": args.controller, "qualified": seed in qualified,
                          "latency_config_ms": cand_extra, "episode_dir": str(rel)}
@@ -483,10 +664,19 @@ def main(argv: Optional[list[str]] = None) -> int:
                     emit(r)
                     m["progress"]["cand_done"] += 1
                     save()
+                    say(f"  [{mode}] seed {seed}: {r['reason']} at {r['survival_time']:.1f} s, {r['targets_collected']} targets"
+                        + ("" if r["valid"] else f" · INVALID ({r['failure_rate']:.0%} failed decisions)"))
+                    if view is not None:
+                        view.send({"type": "episode_end", "result": {"reason": r["reason"]}})
+                        push_plan(f"{mode.upper()} · seed {seed}: {r['reason']}", remaining - 1)
                     if r["fatal_error"]:
                         raise Aborted(r["first_error"])
-                    if not r["valid"]:
-                        say(f"  seed {seed}: invalid episode ({r['failure_rate']:.0%} failed decisions)")
+                    if view is not None and args.pause > 0:
+                        end = time.time() + args.pause  # let the outcome be seen; not part of any measurement
+                        while time.time() < end and not view.closed():
+                            time.sleep(0.05)
+                    if view is not None and view.closed():
+                        raise StopRequested()
                 _atomic(out / "summary.json", build_summary(m, rows, out))
     except Aborted as e:
         m["status"] = "aborted"
@@ -497,7 +687,7 @@ def main(argv: Optional[list[str]] = None) -> int:
               f"Nothing after this point was recorded. Fix it, then continue with:\n"
               f"  python -m benchmark.ablation --resume {out}", flush=True)
         return 3
-    except (Cancelled, KeyboardInterrupt):
+    except (Cancelled, KeyboardInterrupt, StopRequested):
         m["status"] = "cancelled"
         save()
         _atomic(out / "summary.json", build_summary(m, rows, out))
@@ -505,8 +695,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 130
     finally:
         signal.signal(signal.SIGTERM, prev)
+        if view is not None:
+            push_plan(f"{m.get('status', 'done')} · results in {out}")
+            view.finish()
 
-    m["status"] = "complete"
+    left = any(args.limit is not None and ran_now[md] >= args.limit for md in modes)
+    m["status"] = "partial" if left else "complete"
     m["progress"]["stage"] = "done"
     m["wall_time_s"] = m.get("wall_time_s", 0.0) + time.perf_counter() - t0
     save()
@@ -515,6 +709,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not args.quiet:
         print_report(s)
         print(f"\nsaved to {out}")
+        if left:
+            print(f"--limit reached; continue with: python -m benchmark.ablation --resume {out}")
+        if view is not None and not view.closed():
+            print("the live viewer stays open with the final state; close it to exit")
     return 0
 
 

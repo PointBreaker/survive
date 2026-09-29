@@ -40,15 +40,20 @@ def test_paired_seed_identity(tmp_path):
 
 def test_latency_matched_reference(tmp_path):
     d, m, s, rows = run(tmp_path, "--controller", "greedy+200ms", "--match-latency", "200", "--modes", "raw")
-    assert m["experiment_type"] == "paired_solvable" and m["latency"]["reference_ms"] == 200.0
+    assert m["experiment_type"] == "paired_solvable"
     ref = [r for r in rows if r["role"] == "reference"]
-    assert all(r["latency_config_ms"] == 200.0 for r in ref)
-    assert all(abs(r["p50_latency_ms"] - 200.0) < 5 for r in ref if r["p50_latency_ms"] is not None)
+    tick = 1000 / 60
+    assert m["latency"]["reference_ms"] == pytest.approx(12.5 * tick)  # 200 ms (+compute) -> 13 ticks, centred
+    # what matters: reference and candidate decisions take effect after the same number of ticks
+    cand = [r for r in rows if r["role"] == "candidate"]
+    ref_ticks = {round(r["mean_delay_ticks"], 6) for r in ref if r["mean_delay_ticks"] is not None}
+    cand_ticks = {round(r["mean_delay_ticks"], 6) for r in cand if r["mean_delay_ticks"] is not None}
+    assert ref_ticks == cand_ticks == {13.0}
     lm = s["modes"]["raw"]["latency_match"]
-    assert lm["within_tolerance"] is True and abs(lm["ratio"] - 1) < 0.05
+    assert lm["within_tolerance"] is True
     # auto: probe the candidate
     _, m2, _, _ = run(tmp_path, "--controller", "greedy+120ms", "--modes", "raw", name="auto")
-    assert m2["latency"]["how"].startswith("auto") and abs(m2["latency"]["reference_ms"] - 120) < 5
+    assert m2["latency"]["how"].startswith("auto") and m2["latency"]["reference_ms"] == pytest.approx(7.5 * tick)
 
 
 class Spy(SyncController):
@@ -165,3 +170,85 @@ def test_rescore_excludes_invalid_episodes(tmp_path):
     v = s2["modes"]["raw"]
     assert v["invalid_seeds"] == [cand[0]["seed"]] and v["evaluated"] == v["qualified"] - 1
     assert v["candidate"]["episodes"] == v["qualified"] - 1 and s2["valid"] is False
+
+
+def test_observed_environment_is_bit_identical_and_forwards_events():
+    """The live viewer's hook must not change a single tick."""
+    import threading
+
+    from arena.difficulty import PRESETS
+    from arena.environment import Environment
+    from arena.live_view import ObservedEnvironment, TeeRecorder
+    from arena.recorder import NullRecorder
+    from arena.runner import EpisodeRunner
+    from controllers.base import LatencyWrapper
+    from controllers.simple_avoid import SimpleAvoidController
+
+    class FakeView:
+        def __init__(self):
+            self.msgs = []
+            self.closed_evt = threading.Event()
+
+        def frame(self, env, force=False):
+            self.msgs.append(("frame", env.tick))
+
+        def send(self, msg, droppable=False):
+            self.msgs.append(("msg", msg))
+
+    cfg = PRESETS["medium"].with_overrides(max_duration=12)
+    plain = EpisodeRunner(Environment(cfg, 4), LatencyWrapper(SimpleAvoidController(), 150)).run()
+    v = FakeView()
+    watched = EpisodeRunner(ObservedEnvironment(cfg, 4, v), LatencyWrapper(SimpleAvoidController(), 150),
+                            recorder=TeeRecorder(NullRecorder(), v)).run()
+    assert plain["action_changes"] == watched["action_changes"] and plain["reason"] == watched["reason"]
+    assert any(m[0] == "frame" for m in v.msgs)
+    assert any(m[0] == "msg" and m[1]["event"]["type"] == "decision" for m in v.msgs)
+    assert all("observation" not in (m[1].get("event") or {}) for m in v.msgs if m[0] == "msg")
+
+
+def test_closed_viewer_stops_the_episode():
+    import threading
+
+    from arena.difficulty import PRESETS
+    from arena.live_view import ObservedEnvironment, StopRequested
+    from arena.runner import EpisodeRunner
+    from controllers.simple_avoid import SimpleAvoidController
+
+    class V:
+        closed_evt = threading.Event()
+
+        def frame(self, env, force=False):
+            if env.tick == 30:
+                self.closed_evt.set()
+
+    with pytest.raises(StopRequested):
+        EpisodeRunner(ObservedEnvironment(PRESETS["easy"], 0, V()), SimpleAvoidController()).run()
+
+
+def test_reference_latency_is_centred_in_its_tick(tmp_path):
+    _, m, _, rows = run(tmp_path, "--controller", "greedy", "--match-latency", "266.5", "--modes", "raw")
+    tick = 1000 / 60
+    assert m["latency"]["reference_ms"] == pytest.approx(15.5 * tick)  # 266.5 ms -> 16 ticks, centred
+    refs = [r for r in rows if r["role"] == "reference"]
+    assert all(r["mean_delay_ticks"] == pytest.approx(16.0) for r in refs if r["mean_delay_ticks"] is not None)
+
+
+def test_limit_runs_a_few_now_and_resume_finishes(tmp_path):
+    d, m, s, rows = run(tmp_path, "--controller", "greedy", "--match-latency", "0", "--modes", "raw,physics",
+                        "--limit", "1")
+    assert m["status"] == "partial"
+    assert all(v["evaluated"] == 1 for v in s["modes"].values())
+    assert ablation.main(["--resume", str(d), "--quiet"]) == 0
+    s2 = json.loads((d / "summary.json").read_text())
+    assert s2["valid"] and all(v["evaluated"] == v["qualified"] for v in s2["modes"].values())
+
+
+def test_plan_estimate_counts_only_remaining_work(tmp_path):
+    from arena.difficulty import PRESETS
+
+    d, m, s, rows = run(tmp_path, "--controller", "greedy", "--match-latency", "0", "--modes", "raw")
+    cfg = PRESETS["easy"].with_overrides(max_duration=8, world_speed_scale=0.5)
+    full = ablation.estimate(rows, ["raw"], m["candidate_seeds"], cfg, 1, False, None, 0.05, d, [250.0])
+    assert full["episodes"] == 0 and full["exact"]
+    fresh = ablation.estimate([], ["raw", "physics"], list(range(10)), cfg, 1, False, 2, 0.05, None, [250.0])
+    assert fresh["episodes"] == 4 and not fresh["exact"] and fresh["max_total_s"] == pytest.approx(4 * 16.0)
