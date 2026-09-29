@@ -94,3 +94,74 @@ def test_rejects_bad_arguments(tmp_path, args):
     with pytest.raises(SystemExit):
         ablation.main(args + ["--run-dir", str(tmp_path / "x"), "--controller", "greedy"] if "--controller" not in args
                       else args + ["--run-dir", str(tmp_path / "x")])
+
+
+class Flaky(SyncController):
+    """Answers like Greedy until a shared budget runs out, then fails like a service out of credits."""
+    name = "flaky"
+    budget = [0]
+
+    def __init__(self):
+        super().__init__()
+        from controllers.greedy import GreedyController
+        self.inner = GreedyController()
+
+    def reset(self, info):
+        super().reset(info)
+        self.inner.reset(info)
+
+    def decide(self, obs):
+        from controllers.base import Decision
+        if Flaky.budget[0] <= 0:
+            return Decision.failed('ProtocolError: HTTP 402: b\'{"error":{"message":"Insufficient credits."}}\'')
+        Flaky.budget[0] -= 1
+        self.inner.request(obs, None)
+        return self.inner.poll().action
+
+
+def test_fatal_service_error_aborts_and_resume_completes(tmp_path, monkeypatch):
+    import controllers
+
+    real = controllers.make_controller
+    monkeypatch.setattr(controllers, "make_controller", lambda n, **kw: Flaky() if n == "greedy" else real(n, **kw))
+    Flaky.budget[0] = 400  # preflight + a few episodes, then "out of credits"
+    d = tmp_path / "run"
+    args = ["--controller", "greedy", "--match-latency", "0", "--modes", "raw,physics", "--episodes", "6",
+            "--preset", "easy", "--max-duration", "8", "--run-dir", str(d), "--quiet"]
+    assert ablation.main(args) == 3
+    m = json.loads((d / "ablation.json").read_text())
+    assert m["status"] == "aborted" and "402" in m["abort_reason"]
+    s = json.loads((d / "summary.json").read_text())
+    assert s["valid"] is False
+    bad = [r for r in map(json.loads, (d / "results.jsonl").read_text().splitlines()) if not r["valid"]]
+    assert len(bad) == 1 and bad[0]["fatal_error"]  # stopped right after the first refused episode
+    # preflight refuses to start while the service is still refusing
+    with pytest.raises(SystemExit):
+        ablation.main(["--resume", str(d), "--quiet"])
+    Flaky.budget[0] = 10**9  # credits topped up
+    assert ablation.main(["--resume", str(d), "--quiet"]) == 0
+    s = json.loads((d / "summary.json").read_text())
+    rows = [json.loads(l) for l in (d / "results.jsonl").read_text().splitlines()]
+    assert s["valid"] is True and json.loads((d / "ablation.json").read_text())["status"] == "complete"
+    retried = [r for r in rows if r.get("attempt", 0) > 0]
+    assert retried and all(r["valid"] and r["episode_dir"].endswith("_a1") for r in retried)
+    # reference episodes were not re-run
+    refs = [r for r in rows if r["role"] == "reference"]
+    assert len(refs) == len({(r["mode"], r["seed"]) for r in refs})
+    for mode, v in s["modes"].items():
+        assert v["evaluated"] == v["qualified"] and not v["invalid_seeds"]
+
+
+def test_rescore_excludes_invalid_episodes(tmp_path):
+    d, m, s, rows = run(tmp_path, "--controller", "greedy", "--match-latency", "0", "--modes", "raw")
+    # simulate an old artifact: strip validity, then make one candidate episode mostly failed
+    cand = [r for r in rows if r["role"] == "candidate"]
+    for r in rows:
+        for k in ("valid", "failure_rate", "fatal_error", "first_error", "applied_decisions"):
+            r.pop(k, None)
+    cand[0]["failed_decisions"] = cand[0]["decision_count"] * 3
+    (d / "results.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    s2 = ablation.rescore(d)
+    v = s2["modes"]["raw"]
+    assert v["invalid_seeds"] == [cand[0]["seed"]] and v["evaluated"] == v["qualified"] - 1
+    assert v["candidate"]["episodes"] == v["qualified"] - 1 and s2["valid"] is False

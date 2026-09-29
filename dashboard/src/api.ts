@@ -143,7 +143,11 @@ export interface AblationMode {
   candidate_latency: { p50_ms: number | null; mean_ms: number | null };
   reference_latency: { p50_ms: number | null; mean_ms: number | null };
   latency_match: { reference_ms: number; candidate_p50_ms: number | null; ratio: number | null; within_tolerance: boolean | null };
-  pairs: { seed: number; reference: string[]; candidate: string | null; candidate_survival: number | null; candidate_targets: number | null }[];
+  evaluated?: number;
+  invalid_seeds?: number[];
+  invalid_errors?: string[];
+  decision_failure_rate?: number | null;
+  pairs: { seed: number; reference: string[]; candidate: string | null; candidate_valid?: boolean | null; candidate_failure_rate?: number | null; candidate_survival: number | null; candidate_targets: number | null }[];
 }
 
 export interface DecompositionStep {
@@ -187,12 +191,15 @@ export interface AblationRow {
   p50_latency_ms: number | null;
   episode_dir: string;
   qualified?: boolean;
+  attempt?: number;
+  valid?: boolean;
+  failure_rate?: number;
 }
 
 export interface AblationDetail {
   id: string;
   manifest: AblationManifest;
-  summary: { modes: Record<string, AblationMode>; decomposition: DecompositionStep[] } | null;
+  summary: { modes: Record<string, AblationMode>; decomposition: DecompositionStep[]; valid?: boolean; status?: string; abort_reason?: string | null; max_failure_rate?: number } | null;
   episodes: AblationRow[];
 }
 

@@ -54,6 +54,7 @@ from typing import Any, Callable, Optional
 
 from arena.action import Action
 from arena.cli import add_difficulty_args, config_from_args, controller_factory
+from arena.difficulty import DifficultyConfig
 from arena.dotenv import load_dotenv
 from arena.environment import Environment
 from arena.observation_views import MODES
@@ -71,20 +72,29 @@ class Cancelled(Exception):
     pass
 
 
+class Aborted(Exception):
+    """The candidate's service refuses requests (auth, billing): stop instead of recording no-op episodes."""
+
+
 def _atomic(path: Path, data: Any) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, indent=2))
     os.replace(tmp, path)
 
 
-def probe_latency_ms(factory: Callable, config, seed: int, n: int, timeout_s: float = 30.0) -> list[float]:
-    """Wall latency of ``n`` sequential, unscored requests on real observations (nothing is executed)."""
+def probe_latency_ms(factory: Callable, config, seed: int, n: int, timeout_s: float = 30.0,
+                     errors: Optional[list[str]] = None) -> list[float]:
+    """Wall latency of ``n`` sequential, unscored requests on real observations (nothing is executed).
+
+    One extra warm-up request goes first and is discarded (connection setup is not decision latency).
+    Failed requests are not latency; their errors are appended to ``errors``.
+    """
     env = Environment(config, seed)
     ctrl = factory()
     out = []
     try:
         ctrl.reset(env.public_info())
-        for i in range(n):
+        for i in range(n + 1):
             t0 = time.perf_counter()
             ctrl.request(env.observe(), i)
             d = None
@@ -93,7 +103,12 @@ def probe_latency_ms(factory: Callable, config, seed: int, n: int, timeout_s: fl
                 if d is None:
                     time.sleep(0.0005)
             if d is not None and d.action is not None:
-                out.append((time.perf_counter() - t0) * 1000 + d.extra_latency_s * 1000)
+                if i > 0:
+                    out.append((time.perf_counter() - t0) * 1000 + d.extra_latency_s * 1000)
+            elif errors is not None:
+                errors.append(str(d.error if d is not None else "timeout"))
+                if is_fatal(errors[-1]):
+                    break
             for _ in range(6):  # a slightly different snapshot each time
                 env.step(Action.STAY)
     finally:
@@ -120,6 +135,53 @@ def _slim(r: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in r.items() if k != "action_changes"}
 
 
+# Errors that mean the service will not answer at all (auth, billing, access): stop the run
+# instead of recording episodes in which the controller never acted.
+FATAL_ERROR_MARKERS = ("HTTP 401", "HTTP 402", "HTTP 403", "Insufficient credits", "No API token")
+DEFAULT_MAX_FAILURE_RATE = 0.05
+
+
+def is_fatal(error: Optional[str]) -> bool:
+    return bool(error) and any(k.lower() in error.lower() for k in FATAL_ERROR_MARKERS)
+
+
+def episode_validity(row: dict[str, Any], run_dir: Optional[Path] = None,
+                     max_failure_rate: float = DEFAULT_MAX_FAILURE_RATE) -> dict[str, Any]:
+    """Did the controller actually control this episode? Failed decisions leave the previous action
+    running, so an episode full of transport/API errors measures the service, not the controller."""
+    if "failed_decisions" in row:  # real-time runner
+        failed, applied = int(row.get("failed_decisions") or 0), int(row.get("decision_count") or 0)
+    else:  # lockstep runner
+        failed = int((row.get("failed_answers") or {}).get(row.get("controller"), 0))
+        applied = max(0, int(row.get("decision_points") or 0) - failed)
+    first_error = None
+    ev = (Path(run_dir) / row["episode_dir"] / "events.jsonl") if run_dir and row.get("episode_dir") else None
+    if failed and ev and ev.is_file():
+        with open(ev) as f:
+            for line in f:
+                e = json.loads(line)
+                err = e.get("error") if e.get("type") == "decision_failed" else None
+                if e.get("type") == "lockstep_decision":
+                    err = ((e.get("answers") or {}).get(row.get("controller")) or {}).get("error")
+                if err:
+                    first_error = str(err)[:300]
+                    break
+    total = failed + applied
+    rate = failed / total if total else 0.0
+    fatal = is_fatal(first_error)
+    return {"failed_decisions": failed, "applied_decisions": applied, "failure_rate": rate,
+            "first_error": first_error, "fatal_error": fatal,
+            "valid": (rate <= max_failure_rate) and not fatal and (applied > 0 or total == 0)}
+
+
+def latest(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The last attempt per (role, mode, seed, repeat): --resume appends retries, never rewrites."""
+    out: dict[tuple, dict[str, Any]] = {}
+    for r in rows:
+        out[(r["role"], r["mode"], r["seed"], r.get("repeat", 0))] = r
+    return list(out.values())
+
+
 def _lat(rows: list[dict[str, Any]]) -> dict[str, Optional[float]]:
     p50 = [r["p50_latency_ms"] for r in rows if r.get("p50_latency_ms") is not None]
     if not p50:  # lockstep results: per-controller latency block
@@ -143,7 +205,12 @@ def _paired_delta(a: dict[int, bool], b: dict[int, bool]) -> dict[str, Any]:
     }
 
 
-def build_summary(m: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any]:
+def build_summary(m: dict[str, Any], rows: list[dict[str, Any]], run_dir: Optional[Path] = None) -> dict[str, Any]:
+    max_fail = m.get("max_failure_rate", DEFAULT_MAX_FAILURE_RATE)
+    rows = latest(rows)
+    for r in rows:
+        if "valid" not in r:  # runs recorded before validity existed: derive it from the logs
+            r.update(episode_validity(r, run_dir, max_fail))
     modes_out: dict[str, Any] = {}
     cand_success: dict[str, dict[int, bool]] = {}
     for mode in m["modes"]:
@@ -154,8 +221,12 @@ def build_summary(m: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, An
             by_seed.setdefault(r["seed"], []).append(r)
         complete = {s: rs for s, rs in by_seed.items() if len(rs) == m["reference_repeats"]}
         qualified = sorted(s for s, rs in complete.items() if all(x["success"] for x in rs))
-        q_rows = [r for r in cand if r["seed"] in qualified]
-        u_rows = [r for r in cand if r["seed"] not in qualified]
+        q_all = [r for r in cand if r["seed"] in qualified]
+        q_rows = [r for r in q_all if r["valid"]]
+        invalid = [r for r in q_all if not r["valid"]]
+        u_rows = [r for r in cand if r["seed"] not in qualified and r["valid"]]
+        n_failed = sum(r["failed_decisions"] for r in q_all)
+        n_total = n_failed + sum(r["applied_decisions"] for r in q_all)
         first_ref = [rs[0] for rs in complete.values()]
         cand_success[mode] = {r["seed"]: bool(r["success"]) for r in q_rows}
         lat = _lat(q_rows)
@@ -167,7 +238,11 @@ def build_summary(m: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, An
             "qualified": len(qualified),
             "reference_all": aggregate(first_ref) if first_ref else None,
             "reference_qualified": aggregate([rs[0] for s, rs in complete.items() if s in qualified]) if qualified else None,
-            "candidate": aggregate(q_rows) if q_rows else None,
+            "candidate": aggregate(q_rows) if q_rows else None,  # valid episodes only
+            "evaluated": len(q_rows),
+            "invalid_seeds": sorted(r["seed"] for r in invalid),
+            "invalid_errors": sorted({(r["first_error"] or "")[:160] for r in invalid if r["first_error"]}),
+            "decision_failure_rate": (n_failed / n_total) if n_total else None,
             "candidate_unqualified": aggregate(u_rows) if u_rows else None,
             "candidate_latency": lat,
             "reference_latency": _lat(first_ref),
@@ -177,6 +252,8 @@ def build_summary(m: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, An
             },
             "pairs": [{"seed": s,
                        "reference": [x["reason"] for x in complete[s]],
+                       "candidate_valid": next((r["valid"] for r in q_all if r["seed"] == s), None),
+                       "candidate_failure_rate": next((r["failure_rate"] for r in q_all if r["seed"] == s), None),
                        "candidate": next((r["reason"] for r in q_rows if r["seed"] == s), None),
                        "candidate_survival": next((r["survival_time"] for r in q_rows if r["seed"] == s), None),
                        "candidate_targets": next((r["targets_collected"] for r in q_rows if r["seed"] == s), None)}
@@ -194,7 +271,23 @@ def build_summary(m: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, An
                       **_paired_delta(cand_success[last], {s: True for s in modes_out[last]["qualified_seeds"]})})
     return {"experiment_type": m["experiment_type"], "controller": m["controller"],
             "reference_controller": m["reference_controller"], "timing": m["timing"], "modes": modes_out,
-            "decomposition": steps, "latency": m["latency"]}
+            "decomposition": steps, "latency": m["latency"], "max_failure_rate": max_fail,
+            "status": m.get("status"), "abort_reason": m.get("abort_reason"),
+            "valid": all(not v["invalid_seeds"] and v["evaluated"] == v["qualified"] for v in modes_out.values())}
+
+
+def _read_rows(run_dir: Path) -> list[dict[str, Any]]:
+    p = run_dir / "results.jsonl"
+    return [json.loads(l) for l in p.read_text().splitlines() if l.strip()] if p.is_file() else []
+
+
+def rescore(run_dir: Path) -> dict[str, Any]:
+    """Rebuild summary.json from the raw rows and logs (e.g. to apply validity to an older run)."""
+    run_dir = Path(run_dir)
+    m = json.loads((run_dir / "ablation.json").read_text())
+    s = build_summary(m, _read_rows(run_dir), run_dir)
+    _atomic(run_dir / "summary.json", s)
+    return s
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -215,6 +308,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--timing", choices=["realtime", "lockstep"], default="realtime")
     ap.add_argument("--interval", type=float, default=0.1, help="lockstep: world seconds between decisions")
     ap.add_argument("--delay", type=float, default=0.0, help="lockstep: fixed world-time delay for both")
+    ap.add_argument("--max-failure-rate", type=float, default=DEFAULT_MAX_FAILURE_RATE,
+                    help="a candidate episode with a larger share of failed decisions is invalid (excluded)")
+    ap.add_argument("--resume", metavar="RUN_DIR", default=None,
+                    help="continue a run: same manifest; runs missing episodes and re-runs invalid candidate ones")
+    ap.add_argument("--rescore", metavar="RUN_DIR", default=None, help="only rebuild summary.json of a run")
     ap.add_argument("--out", default="runs")
     ap.add_argument("--run-dir", default=None)
     ap.add_argument("--quiet", action="store_true")
@@ -222,73 +320,100 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = ap.parse_args(argv)
     load_dotenv()
 
-    modes = [x.strip() for x in args.modes.split(",") if x.strip()]
-    if not modes or any(md not in MODES for md in modes) or len(set(modes)) != len(modes):
-        ap.error(f"--modes must be distinct values from {','.join(MODES)}")
-    modes = [md for md in MODES if md in modes]
-    try:
-        cand_name, cand_extra = parse_spec(args.controller)
-        ref_name, ref_extra = parse_spec(args.reference)
-    except ValueError as e:
-        ap.error(str(e))
-    if ref_extra:
-        ap.error("give the reference latency with --match-latency, not as +ms")
-    if args.reference_repeats < 1:
-        ap.error("--reference-repeats must be >= 1")
-    lockstep = args.timing == "lockstep"
-    if lockstep and cand_extra:
-        ap.error("added latency is meaningless in lockstep timing")
-    cfg = config_from_args(args)
-    if lockstep:
-        cfg = cfg.with_overrides(world_speed_scale=1.0, decision_hz=1.0 / args.interval, max_inflight=1)
+    if args.rescore:
+        s = rescore(Path(args.rescore))
+        if not args.quiet:
+            print_report(s)
+        return 0
+
+    rows: list[dict[str, Any]] = []
+    if args.resume:
+        out = Path(args.resume)
+        if not (out / "ablation.json").is_file():
+            ap.error(f"{out} is not an ablation run")
+        m = json.loads((out / "ablation.json").read_text())
+        rows = _read_rows(out)
+        modes, seeds, lockstep = m["modes"], m["candidate_seeds"], m["timing"] == "lockstep"
+        cfg = DifficultyConfig.from_dict(m["config"])
+        cand_name, cand_extra = parse_spec(m["controller"])
+        ref_name, ref_ms = m["reference_controller"], m["latency"]["reference_ms"]
+        args.timing, args.interval, args.delay = m["timing"], m.get("interval_s", 0.1), m.get("delay_s", 0.0)
+        args.controller, args.reference_repeats = m["controller"], m["reference_repeats"]
+        args.also_unqualified = m.get("also_unqualified", False)
+        m.setdefault("max_failure_rate", args.max_failure_rate)
+        m.update(status="running", pid=os.getpid(), abort_reason=None)
+        m.setdefault("resumes", []).append({"at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                                            "argv": sys.argv[1:] if argv is None else argv})
+    else:
+        modes = [x.strip() for x in args.modes.split(",") if x.strip()]
+        if not modes or any(md not in MODES for md in modes) or len(set(modes)) != len(modes):
+            ap.error(f"--modes must be distinct values from {','.join(MODES)}")
+        modes = [md for md in MODES if md in modes]
+        try:
+            cand_name, cand_extra = parse_spec(args.controller)
+            ref_name, ref_extra = parse_spec(args.reference)
+        except ValueError as e:
+            ap.error(str(e))
+        if ref_extra:
+            ap.error("give the reference latency with --match-latency, not as +ms")
+        if args.reference_repeats < 1:
+            ap.error("--reference-repeats must be >= 1")
+        lockstep = args.timing == "lockstep"
+        if lockstep and cand_extra:
+            ap.error("added latency is meaningless in lockstep timing")
+        cfg = config_from_args(args)
+        if lockstep:
+            cfg = cfg.with_overrides(world_speed_scale=1.0, decision_hz=1.0 / args.interval, max_inflight=1)
+        seeds = [args.seed + i for i in range(args.episodes)]
 
     def factory(name: str, mode: str, latency_ms: float):
         ns = SimpleNamespace(**{**vars(args), "controller": name, "observation_mode": mode,
                                 "latency_ms": latency_ms, "real_latency": False})
         return controller_factory(name, ns, latency_ms=latency_ms)
 
-    # ---- latency configuration (realtime only: lockstep charges no latency to anyone)
+    # ---- preflight + latency configuration (lockstep charges no latency to anyone)
     probe: list[float] = []
-    if lockstep:
-        ref_ms = 0.0
-        how = "none (lockstep: latency costs no world time)"
-    elif args.match_latency == "auto":
-        probe = probe_latency_ms(factory(cand_name, modes[0], cand_extra), cfg, args.seed, args.probe_requests)
-        if not probe:
-            ap.error("latency probe got no answers from the candidate; give --match-latency explicitly")
-        ref_ms = float(percentile(probe, 50))
-        how = f"auto: median of {len(probe)} probe requests"
-    else:
-        try:
-            ref_ms = float(args.match_latency)
-        except ValueError:
-            ap.error("--match-latency must be a number of ms or 'auto'")
-        if ref_ms < 0:
-            ap.error("--match-latency must be >= 0")
-        how = "fixed"
-
-    out = Path(args.run_dir) if args.run_dir else new_run_dir(args.out, "ablation", cand_name)
-    if args.run_dir and out.exists() and any(out.iterdir()):
-        ap.error(f"--run-dir {out} is not empty")
-    out.mkdir(parents=True, exist_ok=True)
-    seeds = [args.seed + i for i in range(args.episodes)]
+    probe_errors: list[str] = []
+    # Always a short preflight: a service that refuses (no token, no credits) stops the run before it starts.
+    probe_n = args.probe_requests if (not args.resume and not lockstep and args.match_latency == "auto") else 2
+    probe = probe_latency_ms(factory(cand_name, modes[0], cand_extra), cfg, seeds[0], probe_n, errors=probe_errors)
+    if not probe:
+        ap.error("the candidate answered none of the preflight requests"
+                 + (f": {probe_errors[-1][:300]}" if probe_errors else ""))
+    if not args.resume:
+        if lockstep:
+            ref_ms, how = 0.0, "none (lockstep: latency costs no world time)"
+        elif args.match_latency == "auto":
+            ref_ms = float(percentile(probe, 50))
+            how = f"auto: median of {len(probe)} probe requests after 1 warm-up"
+        else:
+            try:
+                ref_ms = float(args.match_latency)
+            except ValueError:
+                ap.error("--match-latency must be a number of ms or 'auto'")
+            if ref_ms < 0:
+                ap.error("--match-latency must be >= 0")
+            how = "fixed"
+        out = Path(args.run_dir) if args.run_dir else new_run_dir(args.out, "ablation", cand_name)
+        if args.run_dir and out.exists() and any(out.iterdir()):
+            ap.error(f"--run-dir {out} is not empty")
+        out.mkdir(parents=True, exist_ok=True)
+        m = {
+            "kind": "ablation", "version": VERSION,
+            "experiment_type": "observation_ablation" if len(modes) > 1 else "paired_solvable",
+            "created": time.strftime("%Y-%m-%dT%H:%M:%S"), "status": "running", "pid": os.getpid(),
+            "controller": args.controller, "reference_controller": ref_name,
+            "reference_repeats": args.reference_repeats, "modes": modes, "timing": args.timing,
+            **({"interval_s": args.interval, "delay_s": args.delay} if lockstep else {}),
+            "candidate_seeds": seeds, "config": cfg.to_dict(),
+            "latency": {"reference_ms": ref_ms, "reference_kind": "simulated_fixed" if not lockstep else "none",
+                        "how": how, "candidate_added_ms": cand_extra, "probe_ms": probe,
+                        "jitter_matched": False},  # a fixed latency has no jitter; trace replay is future work
+            "also_unqualified": args.also_unqualified, "max_failure_rate": args.max_failure_rate,
+            "argv": sys.argv[1:] if argv is None else argv,
+        }
     total = len(modes) * len(seeds) * args.reference_repeats
-    m: dict[str, Any] = {
-        "kind": "ablation", "version": VERSION,
-        "experiment_type": "observation_ablation" if len(modes) > 1 else "paired_solvable",
-        "created": time.strftime("%Y-%m-%dT%H:%M:%S"), "status": "running", "pid": os.getpid(),
-        "controller": args.controller, "reference_controller": ref_name,
-        "reference_repeats": args.reference_repeats, "modes": modes, "timing": args.timing,
-        **({"interval_s": args.interval, "delay_s": args.delay} if lockstep else {}),
-        "candidate_seeds": seeds, "config": cfg.to_dict(),
-        "latency": {"reference_ms": ref_ms, "reference_kind": "simulated_fixed" if not lockstep else "none",
-                    "how": how, "candidate_added_ms": cand_extra, "probe_ms": probe,
-                    "jitter_matched": False},  # a fixed latency has no jitter; trace replay is future work
-        "also_unqualified": args.also_unqualified,
-        "argv": sys.argv[1:] if argv is None else argv,
-        "progress": {"stage": "reference", "mode": None, "done": 0, "total": total},
-        "updated": time.time(),
-    }
+    m["progress"] = {"stage": "reference", "mode": None, "done": 0, "total": total}
 
     def save():
         m["updated"] = time.time()
@@ -299,15 +424,19 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     prev = signal.signal(signal.SIGTERM, on_term)
     save()
-    rows: list[dict[str, Any]] = []
     t0 = time.perf_counter()
     say = (lambda *a: None) if args.quiet else (lambda *a: print(*a, flush=True))
+    max_fail = m["max_failure_rate"]
     try:
-        with open(out / "results.jsonl", "w") as rf:
+        with open(out / "results.jsonl", "a") as rf:
             def emit(row):
                 rows.append(row)
                 rf.write(json.dumps(row, separators=(",", ":")) + "\n")
                 rf.flush()
+
+            def have(role, mode, seed, k=0):
+                return next((r for r in reversed(rows) if (r["role"], r["mode"], r["seed"], r.get("repeat", 0))
+                             == (role, mode, seed, k)), None)
 
             for mode in modes:
                 m["progress"].update(stage="reference", mode=mode)
@@ -317,11 +446,15 @@ def main(argv: Optional[list[str]] = None) -> int:
                 for i, seed in enumerate(seeds):
                     ok = True
                     for k in range(args.reference_repeats):
-                        rel = Path("episodes") / mode / "reference" / (
-                            f"episode_{i:04d}_seed{seed}" + (f"_r{k}" if args.reference_repeats > 1 else ""))
-                        r = run_one(ref_f, ref_name, cfg, seed, out / rel, args.timing, args.interval, args.delay)
-                        emit({**_slim(r), "role": "reference", "mode": mode, "seed": seed, "repeat": k,
-                              "controller_spec": ref_name, "latency_config_ms": ref_ms, "episode_dir": str(rel)})
+                        r = have("reference", mode, seed, k)
+                        if r is None:
+                            rel = Path("episodes") / mode / "reference" / (
+                                f"episode_{i:04d}_seed{seed}" + (f"_r{k}" if args.reference_repeats > 1 else ""))
+                            r = _slim(run_one(ref_f, ref_name, cfg, seed, out / rel, args.timing, args.interval, args.delay))
+                            r = {**r, "role": "reference", "mode": mode, "seed": seed, "repeat": k,
+                                 "controller_spec": ref_name, "latency_config_ms": ref_ms, "episode_dir": str(rel)}
+                            r.update(episode_validity(r, out, max_fail))
+                            emit(r)
                         ok = ok and bool(r["success"])
                         m["progress"]["done"] += 1
                     if ok:
@@ -334,30 +467,51 @@ def main(argv: Optional[list[str]] = None) -> int:
                 save()
                 cand_f = factory(cand_name, mode, cand_extra)
                 for seed in todo:
+                    prior = have("candidate", mode, seed)
+                    if prior is not None and prior.get("valid", episode_validity(prior, out, max_fail)["valid"]):
+                        m["progress"]["cand_done"] += 1
+                        continue
+                    attempt = 0 if prior is None else prior.get("attempt", 0) + 1
                     i = seeds.index(seed)
-                    rel = Path("episodes") / mode / "candidate" / f"episode_{i:04d}_seed{seed}"
-                    r = run_one(cand_f, args.controller, cfg, seed, out / rel, args.timing, args.interval, args.delay)
-                    emit({**_slim(r), "role": "candidate", "mode": mode, "seed": seed, "repeat": 0,
-                          "controller_spec": args.controller, "qualified": seed in qualified,
-                          "latency_config_ms": cand_extra, "episode_dir": str(rel)})
+                    rel = Path("episodes") / mode / "candidate" / (
+                        f"episode_{i:04d}_seed{seed}" + (f"_a{attempt}" if attempt else ""))
+                    r = _slim(run_one(cand_f, args.controller, cfg, seed, out / rel, args.timing, args.interval, args.delay))
+                    r = {**r, "role": "candidate", "mode": mode, "seed": seed, "repeat": 0, "attempt": attempt,
+                         "controller_spec": args.controller, "qualified": seed in qualified,
+                         "latency_config_ms": cand_extra, "episode_dir": str(rel)}
+                    r.update(episode_validity(r, out, max_fail))
+                    emit(r)
                     m["progress"]["cand_done"] += 1
                     save()
-                _atomic(out / "summary.json", build_summary(m, rows))
+                    if r["fatal_error"]:
+                        raise Aborted(r["first_error"])
+                    if not r["valid"]:
+                        say(f"  seed {seed}: invalid episode ({r['failure_rate']:.0%} failed decisions)")
+                _atomic(out / "summary.json", build_summary(m, rows, out))
+    except Aborted as e:
+        m["status"] = "aborted"
+        m["abort_reason"] = str(e)
+        save()
+        _atomic(out / "summary.json", build_summary(m, rows, out))
+        print(f"aborted: the candidate's service refused requests ({str(e)[:200]}).\n"
+              f"Nothing after this point was recorded. Fix it, then continue with:\n"
+              f"  python -m benchmark.ablation --resume {out}", flush=True)
+        return 3
     except (Cancelled, KeyboardInterrupt):
         m["status"] = "cancelled"
-        _atomic(out / "summary.json", build_summary(m, rows))
         save()
-        print(f"cancelled; partial results kept in {out}", flush=True)
+        _atomic(out / "summary.json", build_summary(m, rows, out))
+        print(f"cancelled; partial results kept in {out} (continue with --resume {out})", flush=True)
         return 130
     finally:
         signal.signal(signal.SIGTERM, prev)
 
-    s = build_summary(m, rows)
-    _atomic(out / "summary.json", s)
     m["status"] = "complete"
     m["progress"]["stage"] = "done"
-    m["wall_time_s"] = time.perf_counter() - t0
+    m["wall_time_s"] = m.get("wall_time_s", 0.0) + time.perf_counter() - t0
     save()
+    s = build_summary(m, rows, out)
+    _atomic(out / "summary.json", s)
     if not args.quiet:
         print_report(s)
         print(f"\nsaved to {out}")
@@ -367,10 +521,20 @@ def main(argv: Optional[list[str]] = None) -> int:
 def print_report(s: dict[str, Any]) -> None:
     f = lambda x, d=2: "-" if x is None else f"{x:.{d}f}"  # noqa: E731
     print(f"\nObservation ablation · {s['controller']} · reference {s['reference_controller']} · {s['timing']}")
+    if s.get("status") == "aborted":
+        print(f"  ABORTED: {str(s.get('abort_reason'))[:200]}")
+    if not s.get("valid", True):
+        print("  INCOMPLETE: some qualified seeds have no valid candidate episode (see 'evaluated' per mode)")
     for mode, v in s["modes"].items():
         c = v["candidate"]
         print(f"\n{mode.upper()}")
         print(f"  reference qualified seeds  {v['qualified']} / {v['candidate_seeds']}")
+        fr = v.get("decision_failure_rate")
+        print(f"  valid candidate episodes   {v.get('evaluated', '-')} / {v['qualified']}"
+              + (f"  (invalid seeds {v['invalid_seeds']})" if v.get("invalid_seeds") else "")
+              + (f"  · failed decisions {fr:.0%}" if fr else ""))
+        for err in v.get("invalid_errors", [])[:2]:
+            print(f"    error: {err[:140]}")
         if c:
             lo, hi = c["success_rate_ci95"]
             print(f"  success                    {c['successes']} / {c['episodes']}  ({f(c['success_rate'])}, 95% CI {f(lo)}-{f(hi)})")

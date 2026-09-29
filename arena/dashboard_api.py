@@ -436,7 +436,8 @@ class DashboardAPI:
             except ValueError:
                 summary = None
         keep = ("role", "mode", "seed", "repeat", "success", "reason", "survival_time", "targets_collected",
-                "p50_latency_ms", "mean_decision_latency_ms", "episode_dir", "qualified", "controller_spec")
+                "p50_latency_ms", "mean_decision_latency_ms", "episode_dir", "qualified", "controller_spec",
+                "attempt", "valid", "failure_rate")
         rows = [{k: r.get(k) for k in keep} for r in _read_jsonl(d / "results.jsonl")] \
             if (d / "results.jsonl").is_file() else []
         return {"id": d.name, "manifest": m, "summary": summary, "episodes": rows}

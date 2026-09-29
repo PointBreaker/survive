@@ -192,6 +192,15 @@ python -m benchmark.ablation --controller jev --modes raw --timing lockstep   # 
 python -m benchmark.snapshot runs/<run>/episodes/raw/candidate/episode_0003_seed3 --auto
 ```
 
+**Validity.** A failed decision leaves the previous action running, so an episode full of
+API errors measures the service, not the controller. A candidate episode with more than
+`--max-failure-rate` (default 5%) failed decisions is marked invalid and excluded from every number.
+An auth or billing error (HTTP 401/402/403) aborts the run at once, and a short preflight
+refuses to start while the service refuses. `--resume <run>` continues the same experiment: missing
+episodes are run, invalid candidate episodes are re-run (appended as `_a1`, `_a2`, …), and the
+reference and valid episodes are kept. `--rescore <run>` rebuilds `summary.json`, including for
+runs recorded before validity existed.
+
 The report and the dashboard's **Ablation** tab show per mode: qualified seeds, success
 (Wilson CI), survival, targets and *measured* latency (with a mismatch flag against the
 reference latency). They also show a paired **capability decomposition**: RAW → RELATIVE,

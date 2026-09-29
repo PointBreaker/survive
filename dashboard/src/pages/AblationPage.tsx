@@ -1,4 +1,4 @@
-import { CheckCircle2, Clock, Loader2, OctagonX, Play, ShieldAlert, ShieldCheck } from "lucide-react";
+import { CheckCircle2, Clock, Loader2, OctagonX, Play, ShieldAlert, ShieldCheck, TriangleAlert } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
@@ -121,6 +121,7 @@ function AblationBody({ data, pick, setPick }: {
           </div>
         </div>
       )}
+      {s && (s.valid === false || s.status === "aborted") && <ValidityBanner data={data} />}
       <div className="facts">
         <Fact k="Candidate" v={controllerLabel(m.controller)} />
         <Fact k="Reference (feasibility baseline)" v={`${controllerLabel(m.reference_controller)}${m.reference_repeats > 1 ? ` · ${m.reference_repeats}× each` : ""}`} />
@@ -180,6 +181,31 @@ function AblationBody({ data, pick, setPick }: {
   );
 }
 
+function ValidityBanner({ data }: { data: AblationDetail }) {
+  const s = data.summary!;
+  const errors = [...new Set(Object.values(s.modes).flatMap((v) => v.invalid_errors ?? []))];
+  return (
+    <div className="validity-banner" role="alert">
+      <TriangleAlert size={18} />
+      <div>
+        <div className="vb-title">
+          {s.status === "aborted" ? "Run aborted: the candidate's service refused requests" : "Incomplete: some qualified seeds have no valid candidate episode"}
+        </div>
+        <div className="vb-body">
+          {Object.entries(s.modes).map(([md, v]) => (
+            <span key={md}><b>{MODE_LABEL[md] ?? md}</b> {v.evaluated ?? 0} / {v.qualified} valid{v.decision_failure_rate ? ` · ${fmtPct(v.decision_failure_rate)} failed decisions` : ""}</span>
+          ))}
+        </div>
+        {errors.slice(0, 1).map((e) => <div key={e} className="mono small">{e}</div>)}
+        <div className="vb-body">
+          Invalid episodes (more than {fmtPct(s.max_failure_rate ?? 0.05)} failed decisions, or an auth/billing error) are excluded from every
+          number below. Continue after fixing: <span className="mono">python -m benchmark.ablation --resume runs/{data.id}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function Fact({ k, v, small }: { k: string; v: string; small?: string }) {
   return (
     <div className="fact">
@@ -194,7 +220,8 @@ function ModeBars({ modes, s, cand, refColor, refLabel }: {
 }) {
   const last = s[modes[modes.length - 1]];
   const items = [
-    ...modes.map((md) => ({ key: md, label: MODE_LABEL[md], note: MODE_NOTE[md], agg: s[md].candidate, color: cand, sub: `${s[md].candidate?.successes ?? 0} / ${s[md].candidate?.episodes ?? 0}` })),
+    ...modes.map((md) => ({ key: md, label: MODE_LABEL[md], note: MODE_NOTE[md], agg: s[md].candidate, color: cand,
+      sub: `${s[md].candidate?.successes ?? 0} / ${s[md].candidate?.episodes ?? 0}` + ((s[md].evaluated ?? s[md].qualified) < s[md].qualified ? ` · ${s[md].evaluated ?? 0} of ${s[md].qualified} valid` : "") })),
     { key: "reference", label: `Reference`, note: `${refLabel} @ same latency`, agg: last?.reference_qualified ?? null, color: refColor,
       sub: last ? `qualified ${last.qualified} / ${last.candidate_seeds} (${fmtPct(last.reference_all?.success_rate)})` : "" },
   ];
@@ -228,7 +255,7 @@ function ModeBars({ modes, s, cand, refColor, refLabel }: {
                   <text x={cx + 12} y={Y(hi) - 7} fontSize="12.5" fontWeight={650} fill="var(--text-1)" textAnchor="start">{fmtPct(v)}</text>
                 </>
               )}
-              {v === null && <text x={cx} y={Y(0) - 8} fontSize="11" fill="var(--text-3)" textAnchor="middle">not run</text>}
+              {v === null && <text x={cx} y={Y(0) - 8} fontSize="11" fill="var(--text-3)" textAnchor="middle">no valid episodes</text>}
               <text x={cx} y={H - 38} fontSize="12" fontWeight={600} fill="var(--text-1)" textAnchor="middle">{it.label}</text>
               <text x={cx} y={H - 23} fontSize="10.5" fill="var(--text-3)" textAnchor="middle">{it.note}</text>
               <text x={cx} y={H - 9} fontSize="10.5" fill="var(--text-3)" textAnchor="middle">{it.sub}</text>
@@ -292,7 +319,9 @@ function SeedTable({ data, modes, pick, setPick }: {
 }) {
   const rows = data.episodes;
   const seeds = data.manifest.candidate_seeds;
-  const get = (role: string, mode: string, seed: number) => rows.find((r) => r.role === role && r.mode === mode && r.seed === seed && r.repeat === 0);
+  // latest attempt wins (--resume appends retries)
+  const get = (role: string, mode: string, seed: number) =>
+    [...rows].reverse().find((r) => r.role === role && r.mode === mode && r.seed === seed && r.repeat === 0);
   return (
     <Card title="Paired Seeds" sub="each row is one world (same seed, config and latency for every cell); click a cell to replay and inspect decisions">
       <div className="table-scroll">
@@ -315,7 +344,15 @@ function SeedTable({ data, modes, pick, setPick }: {
                   {modes.map((md) => {
                     const c = get("candidate", md, seed);
                     const q = data.summary?.modes[md]?.qualified_seeds.includes(seed);
-                    return c ? (
+                    const invalid = data.summary?.modes[md]?.invalid_seeds?.includes(seed);
+                    const pair = data.summary?.modes[md]?.pairs.find((p) => p.seed === seed);
+                    return c && invalid ? (
+                      <td key={md} className={`clickable${pick?.seed === seed && pick.mode === md && pick.role === "candidate" ? " on" : ""}`}
+                          onClick={() => setPick({ mode: md, seed, role: "candidate" })} title="excluded: the controller did not control this episode">
+                        <span className="pill" style={{ color: "var(--warning)", borderColor: "var(--warning)" }}><TriangleAlert size={12} />Invalid</span>
+                        <span className="muted tnum" style={{ marginLeft: 8 }}>{fmtPct(pair?.candidate_failure_rate ?? null)} failed decisions</span>
+                      </td>
+                    ) : c ? (
                       <Cell key={md} row={c} dim={!q} active={pick?.seed === seed && pick.mode === md && pick.role === "candidate"}
                             onClick={() => setPick({ mode: md, seed, role: "candidate" })} />
                     ) : (
