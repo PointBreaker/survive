@@ -263,3 +263,41 @@ table.runs tr.clickable:hover td { background: var(--surface-2); }
 
 .loading-dim { opacity: 0.55; transition: opacity 0.2s; }
 .error { color: var(--critical); }
+
+/* ------------------------------------------------------------- phase 3: jobs */
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-link {
+  display: inline-flex; align-items: center; gap: 5px; margin-top: 8px; padding: 0; border: 0;
+  background: none; color: var(--text-3); font-size: 11.5px; cursor: pointer;
+}
+.btn-link:hover:not(:disabled) { color: var(--text-1); }
+.confirm { border: 1px solid rgba(250, 178, 25, 0.45); background: rgba(250, 178, 25, 0.06); border-radius: var(--radius-sm); padding: 10px 12px; }
+.confirm-title { font-weight: 600; color: var(--warning); font-size: 12.5px; }
+.confirm-body { color: var(--text-2); font-size: 12px; margin: 4px 0 10px; }
+.confirm-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.spin { animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.job-strip {
+  display: grid; grid-template-columns: auto 1fr auto; gap: 16px; align-items: center;
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-1); padding: 12px 16px;
+}
+.job-strip.running { border-color: var(--accent-line); }
+.job-strip.failed { border-color: rgba(208, 59, 59, 0.6); }
+.job-state { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13px; white-space: nowrap; }
+.job-mid { min-width: 0; display: grid; gap: 6px; }
+.job-meta { display: flex; gap: 14px; flex-wrap: wrap; color: var(--text-3); font-size: 12px; font-variant-numeric: tabular-nums; }
+.job-meta b { color: var(--text-1); font-weight: 600; }
+.job-bar { height: 6px; border-radius: 3px; background: var(--surface-3); overflow: hidden; }
+.job-bar > div { height: 100%; background: var(--accent); border-radius: 3px; transition: width 0.4s ease; }
+.job-actions { display: flex; gap: 8px; }
+.job-log {
+  grid-column: 1 / -1; margin: 0; max-height: 180px; overflow: auto; padding: 10px; border-radius: 6px;
+  background: #0b0f15; border: 1px solid var(--border); font: 11px/1.5 var(--mono); color: var(--text-2); white-space: pre-wrap;
+}
+.chart-overlay {
+  position: absolute; inset: 40px 150px 60px 60px; display: grid; place-items: center; text-align: center;
+  color: var(--text-2); font-size: 13px; z-index: 2; pointer-events: none; padding: 0 20px;
+}
+.chart-overlay > * , .chart-overlay { text-shadow: none; }
+.chart-overlay span { background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; }

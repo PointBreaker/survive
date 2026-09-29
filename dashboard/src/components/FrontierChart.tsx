@@ -72,8 +72,19 @@ export function FrontierChart({ suite, metric, styles }: { suite: SuiteDetail; m
 
   const lastIndex = rows.length - 1;
 
+  const measured = rows.some((r) => styles.some((s) => typeof r[s.spec] === "number"));
+  const current = manifest.progress?.current;
   return (
-    <div style={{ width: "100%", height: 410 }}>
+    <div style={{ width: "100%", height: 410, position: "relative" }}>
+      {!measured && (
+        <div className="chart-overlay">
+          <span>
+          {manifest.status === "running"
+            ? `Measuring the first point${current ? ` (${styles.find((s) => s.spec === current.controller)?.label ?? current.controller} @ ${pinfo.unit(current.level)})` : ""}. Points appear as each one completes.`
+            : "No completed points in this suite."}
+          </span>
+        </div>
+      )}
       <ResponsiveContainer>
         <ComposedChart data={rows} margin={{ top: 10, right: 150, bottom: 22, left: 4 }}>
           <CartesianGrid stroke="var(--grid)" vertical={false} />
@@ -124,14 +135,14 @@ export function FrontierChart({ suite, metric, styles }: { suite: SuiteDetail; m
               strokeWidth={2}
               isAnimationActive={false}
               connectNulls
-              dot={(p: { cx?: number; cy?: number; index?: number }) =>
-                p.cx === undefined || p.cy === undefined ? <g key={`${s.spec}-${p.index}`} /> : (
-                  <ShapeMark key={`${s.spec}-${p.index}`} shape={s.shape} x={p.cx} y={p.cy} r={4.2} fill={s.color} stroke="var(--surface-1)" />
+              dot={(p: { cx?: number | null; cy?: number | null; index?: number; value?: unknown }) =>
+                !Number.isFinite(p.cx) || !Number.isFinite(p.cy) || p.value == null ? <g key={`${s.spec}-${p.index}`} /> : (
+                  <ShapeMark key={`${s.spec}-${p.index}`} shape={s.shape} x={p.cx as number} y={p.cy as number} r={4.2} fill={s.color} stroke="var(--surface-1)" />
                 )
               }
-              activeDot={(p: { cx?: number; cy?: number }) =>
-                p.cx === undefined || p.cy === undefined ? <g /> : (
-                  <ShapeMark shape={s.shape} x={p.cx} y={p.cy} r={5.6} fill={s.color} stroke="var(--surface-1)" />
+              activeDot={(p: { cx?: number | null; cy?: number | null; value?: unknown }) =>
+                !Number.isFinite(p.cx) || !Number.isFinite(p.cy) || p.value == null ? <g /> : (
+                  <ShapeMark shape={s.shape} x={p.cx as number} y={p.cy as number} r={5.6} fill={s.color} stroke="var(--surface-1)" />
                 )
               }
             />

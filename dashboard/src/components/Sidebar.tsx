@@ -1,6 +1,6 @@
-import { Check, ChevronDown, ChevronRight, Copy, FlaskConical, Terminal } from "lucide-react";
-import { useMemo, useState } from "react";
-import type { Meta } from "../api";
+import { Check, ChevronDown, ChevronRight, Copy, FlaskConical, Loader2, Play, Terminal } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import type { Job, JobSpec, Meta } from "../api";
 import { controllerLabel, seriesStyles } from "../theme";
 import { paramInfo } from "../format";
 
@@ -16,10 +16,14 @@ const DEFAULT_LEVELS: Record<string, number[]> = {
 };
 
 /**
- * Experiment configuration -> the exact CLI command that runs it.
- * Phase 1 does not start benchmarks from the browser; it never pretends to.
+ * Experiment configuration. "Run benchmark" asks the local dashboard server to
+ * run exactly the command shown below (python -m benchmark.suite ...).
  */
-export function Sidebar({ meta }: { meta: Meta | null }) {
+export function Sidebar({ meta, activeJob, onRun }: {
+  meta: Meta | null;
+  activeJob: Job | null;
+  onRun: (spec: JobSpec) => Promise<void>;
+}) {
   const [preset, setPreset] = useState("medium");
   const [controllers, setControllers] = useState<string[]>(["jev", "simple_avoid", "greedy", "random"]);
   const [param, setParam] = useState("world_speed_scale");
@@ -35,6 +39,13 @@ export function Sidebar({ meta }: { meta: Meta | null }) {
   const [timeout, setTimeoutS] = useState("");
   const [matched, setMatched] = useState("");
   const [copied, setCopied] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [runError, setRunError] = useState<string | null>(null);
+  // Without a token Jev can't run: start with it unchecked (still selectable, marked "no token").
+  useEffect(() => {
+    if (meta && !meta.jev_token) setControllers((cs) => cs.filter((c) => c !== "jev"));
+  }, [meta]);
 
   const presets = meta?.presets ?? {};
   const available = meta?.benchmarkable ?? ["jev", "simple_avoid", "greedy", "random"];
@@ -60,6 +71,56 @@ export function Sidebar({ meta }: { meta: Meta | null }) {
     if (timeout) parts.push(`--target-timeout ${timeout}`);
     return parts.join(" \\\n  ");
   }, [controllers, matched, param, levels, episodes, preset, obstacles, hz, duration, seed, inflight, deadline, timeout]);
+
+  const spec: JobSpec = useMemo(() => {
+    const ctrls = [...controllers];
+    if (matched && Number(matched) > 0) ctrls.push(`simple_avoid+${Number(matched)}ms`);
+    const num = (v: string) => (v.trim() === "" ? undefined : Number(v));
+    return {
+      controllers: ctrls,
+      param,
+      levels: [...levels].sort((a, b) => a - b),
+      episodes: Number(episodes || 20),
+      preset,
+      seed: num(seed),
+      obstacles: param === "obstacle_count" ? undefined : num(obstacles),
+      decision_hz: num(hz),
+      max_duration: num(duration),
+      max_inflight: num(inflight),
+      deadline_ms: num(deadline),
+      target_timeout: num(timeout),
+    };
+  }, [controllers, matched, param, levels, episodes, preset, seed, obstacles, hz, duration, inflight, deadline, timeout]);
+
+  // Upper bound on Jev API calls: every episode lasting its full length, one
+  // request per decision slot (episodes that end early make fewer).
+  const jevRequestBound = useMemo(() => {
+    if (!controllers.includes("jev")) return 0;
+    const hzN = Number(hz) || 10;
+    const dur = Number(duration) || 60;
+    const eps = Number(episodes) || 20;
+    const baseSpeed = 1;
+    return Math.round(levels.reduce((sum, lv) => sum + eps * (dur / (param === "world_speed_scale" ? lv : baseSpeed)) * hzN, 0));
+  }, [controllers, hz, duration, episodes, levels, param]);
+
+  const run = async () => {
+    if (jevRequestBound && !confirming) {
+      setConfirming(true);
+      return;
+    }
+    setConfirming(false);
+    setStarting(true);
+    setRunError(null);
+    try {
+      await onRun(spec);
+    } catch (e) {
+      setRunError(String((e as Error).message ?? e));
+    } finally {
+      setStarting(false);
+    }
+  };
+  const busy = !!activeJob && (activeJob.status === "running" || activeJob.status === "cancelling");
+  const canRun = !!meta?.jobs_enabled && controllers.length + (matched ? 1 : 0) > 0 && levels.length > 0 && !busy && !starting;
 
   const pointCount = levels.length * (controllers.length + (matched && Number(matched) > 0 ? 1 : 0));
   const toggle = (c: string) => setControllers((cs) => (cs.includes(c) ? cs.filter((x) => x !== c) : [...cs, c]));
@@ -163,13 +224,42 @@ export function Sidebar({ meta }: { meta: Meta | null }) {
       </div>
 
       <div className="side-section">
-        <button className="btn primary block" onClick={copy} disabled={!controllers.length || !levels.length}>
-          {copied ? <Check size={15} /> : <Copy size={15} />} {copied ? "Copied" : "Copy benchmark command"}
-        </button>
+        {meta?.jobs_enabled ? (
+          <>
+            {confirming ? (
+              <div className="confirm">
+                <div className="confirm-title">Jev makes real API calls</div>
+                <div className="confirm-body">
+                  Up to <b className="tnum">{jevRequestBound.toLocaleString()}</b> requests (every episode at full length,
+                  one per decision slot). Episodes that end early use fewer.
+                </div>
+                <div className="confirm-actions">
+                  <button className="btn" onClick={() => setConfirming(false)}>Back</button>
+                  <button className="btn primary" onClick={run}><Play size={14} /> Run anyway</button>
+                </div>
+              </div>
+            ) : (
+              <button className="btn primary block" onClick={run} disabled={!canRun} title={busy ? "a benchmark is already running" : undefined}>
+                {starting ? <Loader2 size={15} className="spin" /> : <Play size={15} />}
+                {busy ? "Benchmark running…" : starting ? "Starting…" : "Run benchmark"}
+              </button>
+            )}
+            {runError && <div className="error" style={{ marginTop: 8, fontSize: 12 }}>{runError}</div>}
+            <button className="btn-link" onClick={copy} disabled={!controllers.length || !levels.length}>
+              {copied ? <Check size={12} /> : <Copy size={12} />} {copied ? "copied" : "copy as command"}
+            </button>
+          </>
+        ) : (
+          <button className="btn primary block" onClick={copy} disabled={!controllers.length || !levels.length}>
+            {copied ? <Check size={15} /> : <Copy size={15} />} {copied ? "Copied" : "Copy benchmark command"}
+          </button>
+        )}
         <div className="cmd" aria-label="benchmark command"><Terminal size={11} style={{ verticalAlign: -1, marginRight: 5 }} />{command}</div>
         <div className="hint">
-          {pointCount} points × {episodes || 20} episodes. Run it in your terminal; the suite appears in the run selector
-          as soon as it starts and fills in live.
+          {pointCount} points × {episodes || 20} episodes = {(pointCount * Number(episodes || 20)).toLocaleString()} episodes.
+          {meta?.jobs_enabled
+            ? " Runs locally through the same CLI; one benchmark at a time so measured latency isn't distorted."
+            : " This server is read-only: run the command in your terminal; the suite appears here and fills in live."}
         </div>
       </div>
     </aside>

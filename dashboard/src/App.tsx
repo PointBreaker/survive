@@ -1,6 +1,6 @@
 import { BarChart3, Gamepad2, GitCompareArrows, ListTree, Radar } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
-import { api, type Meta, type RunInfo, type SuiteDetail } from "./api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { api, type Job, type JobSpec, type Meta, type RunInfo, type SuiteDetail } from "./api";
 import { paramInfo } from "./format";
 import { controllerLabel } from "./theme";
 import { BenchmarkPage } from "./pages/BenchmarkPage";
@@ -23,7 +23,10 @@ function parseHash(): { route: Route; suite: string | null } {
 function suiteLabel(s: RunInfo): string {
   const ctrls = (s.controllers ?? []).map((c) => controllerLabel(String(c))).join(", ");
   const date = new Date(s.mtime * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" });
-  return `${paramInfo(s.param ?? "").label} · ${ctrls} · ${date}${s.status === "running" ? " · running" : ""}`;
+  const st = s.status === "running" && s.progress
+    ? ` · running ${Math.round((s.progress.episodes_done / Math.max(1, s.progress.episodes_total)) * 100)}%`
+    : s.status && s.status !== "complete" ? ` · ${s.status}` : "";
+  return `${paramInfo(s.param ?? "").label} · ${ctrls} · ${date}${st}`;
 }
 
 export default function App() {
@@ -33,6 +36,9 @@ export default function App() {
   const [suite, setSuite] = useState<SuiteDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [dismissed, setDismissed] = useState<string | null>(null);
+  const [follow, setFollow] = useState<string | null>(null); // job started from this tab
 
   const suites = runs.filter((r) => r.kind === "suite");
   const defaultSuite = suites.find((s) => s.param === "world_speed_scale") ?? suites[0];
@@ -55,6 +61,49 @@ export default function App() {
   }, [selectedId]);
 
   const refreshRuns = useCallback(() => api.runs().then(setRuns).catch((e) => setError(String(e.message ?? e))), []);
+
+  // Jobs: fast polling while one runs, slow otherwise.
+  const job = jobs[0] && jobs[0].id !== dismissed ? jobs[0] : null;
+  const jobActive = !!job && (job.status === "running" || job.status === "cancelling");
+  const refreshJobs = useCallback(() => {
+    if (!meta?.jobs_enabled) return Promise.resolve();
+    return api.jobs().then(setJobs).catch(() => undefined);
+  }, [meta?.jobs_enabled]);
+  useEffect(() => {
+    refreshJobs();
+    const t = setInterval(() => {
+      refreshJobs();
+      if (jobActive) refreshRuns();
+    }, jobActive ? 1500 : 10000);
+    return () => clearInterval(t);
+  }, [refreshJobs, refreshRuns, jobActive]);
+
+  // Jump to a suite started from this tab as soon as its manifest exists.
+  useEffect(() => {
+    const j = jobs.find((x) => x.id === follow);
+    if (j?.suite_id && runs.some((r) => r.id === j.suite_id)) {
+      setFollow(null);
+      go("benchmark", j.suite_id);
+    }
+  }, [jobs, runs, follow]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // When a job ends, refresh the run list at once so the suite's final status shows.
+  const lastStatus = useRef<string | null>(null);
+  useEffect(() => {
+    const st = job?.status ?? null;
+    if (lastStatus.current && ["running", "cancelling"].includes(lastStatus.current) && st && !["running", "cancelling"].includes(st)) {
+      refreshRuns();
+    }
+    lastStatus.current = st;
+  }, [job?.status, refreshRuns]);
+
+  const onRun = async (spec: JobSpec) => {
+    const j = await api.startJob(spec);
+    setDismissed(null);
+    setFollow(j.id);
+    setJobs((cur) => [j, ...cur.filter((x) => x.id !== j.id)]);
+  };
+  const onCancelJob = (id: string) => api.cancelJob(id).then(() => refreshJobs()).catch((e) => setError(String(e.message ?? e)));
   useEffect(() => {
     api.meta().then(setMeta).catch(() => undefined);
     refreshRuns().finally(() => setLoading(false));
@@ -69,8 +118,11 @@ export default function App() {
       return;
     }
     let cancelled = false;
+    let first = true;
     const load = () => {
-      setLoading(true);
+      // Dim only when switching suites; live refreshes keep the frame steady.
+      if (first) setLoading(true);
+      first = false;
       api
         .suite(selectedId)
         .then((s) => !cancelled && (setSuite(s), setError(null)))
@@ -79,7 +131,7 @@ export default function App() {
     };
     load();
     const running = suites.find((s) => s.id === selectedId)?.status === "running";
-    const t = running ? setInterval(load, 5000) : undefined;
+    const t = running ? setInterval(load, 3000) : undefined;
     return () => {
       cancelled = true;
       if (t) clearInterval(t);
@@ -118,7 +170,17 @@ export default function App() {
         </div>
       </header>
       {route === "benchmark" && (
-        <BenchmarkPage meta={meta} suites={suites} suite={suite?.id === selectedId ? suite : null} loading={loading} onSelectSuite={(id) => go("benchmark", id)} />
+        <BenchmarkPage
+          meta={meta}
+          suites={suites}
+          suite={suite?.id === selectedId ? suite : null}
+          loading={loading}
+          onSelectSuite={(id) => go("benchmark", id)}
+          job={job}
+          onRun={onRun}
+          onCancelJob={onCancelJob}
+          onDismissJob={() => job && setDismissed(job.id)}
+        />
       )}
       {route === "compare" && <ComparePage suite={suite?.id === selectedId ? suite : null} />}
       {route === "runs" && <RunsPage runs={runs} onOpenSuite={(id) => go("benchmark", id)} />}

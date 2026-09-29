@@ -1,6 +1,7 @@
 import { Activity } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import type { Meta, RunInfo, SuiteDetail } from "../api";
+import type { Job, JobSpec, Meta, RunInfo, SuiteDetail } from "../api";
+import { JobStrip } from "../components/JobStrip";
 import { CompareRuns } from "../components/CompareRuns";
 import { DecisionOutcomes } from "../components/DecisionOutcomes";
 import { FailureAnalysis } from "../components/FailureAnalysis";
@@ -35,6 +36,10 @@ export function BenchmarkPage(props: {
   suite: SuiteDetail | null;
   loading: boolean;
   onSelectSuite: (id: string) => void;
+  job: Job | null;
+  onRun: (spec: JobSpec) => Promise<void>;
+  onCancelJob: (id: string) => void;
+  onDismissJob: () => void;
 }) {
   const { suite, suites } = props;
   const [metric, setMetric] = useState<Metric>("success");
@@ -59,7 +64,7 @@ export function BenchmarkPage(props: {
 
   return (
     <div className="page">
-      <Sidebar meta={props.meta} />
+      <Sidebar meta={props.meta} activeJob={props.job} onRun={props.onRun} />
       <main className="main">
         <div className="main-inner">
           <div className="hero-head">
@@ -85,6 +90,16 @@ export function BenchmarkPage(props: {
             </div>
           </div>
 
+          {props.job && (
+            <JobStrip
+              job={props.job}
+              viewing={props.job.suite_id === suite?.id}
+              onView={() => props.job?.suite_id && props.onSelectSuite(props.job.suite_id)}
+              onCancel={() => props.job && props.onCancelJob(props.job.id)}
+              onDismiss={props.onDismissJob}
+            />
+          )}
+
           {!suite ? (
             props.loading ? <Card><div className="muted">Loading…</div></Card> : <EmptyFrontier />
           ) : (
@@ -92,7 +107,13 @@ export function BenchmarkPage(props: {
               <div className="grid-top">
                 <Card
                   title={`${METRICS.find((m) => m.value === metric)!.label} vs. ${paramInfo(suite.manifest.param).label}`}
-                  sub={`Observed over ${suite.manifest.episodes_per_point} paired seeds per point${metric === "success" ? " · band = 95% Wilson interval" : ""}${suite.manifest.status === "running" ? " · suite still running, updating live" : ""}`}
+                  sub={`Observed over ${suite.manifest.episodes_per_point} paired seeds per point${metric === "success" ? " · band = 95% Wilson interval" : ""}${
+                    suite.manifest.status === "running"
+                      ? ` · running: ${suite.manifest.progress?.points_done ?? 0}/${suite.manifest.progress?.points_total ?? "?"} points measured, updating live`
+                      : suite.manifest.status === "cancelled" || suite.manifest.status === "interrupted"
+                        ? ` · ${suite.manifest.status}: only completed points are shown`
+                        : ""
+                  }`}
                 >
                   <Legend styles={styles} />
                   <FrontierChart suite={suite} metric={metric} styles={styles} />

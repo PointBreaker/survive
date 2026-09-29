@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import signal
 import sys
 import time
 from pathlib import Path
@@ -74,6 +76,17 @@ def build_summary(manifest: dict[str, Any], results: list[dict[str, Any]]) -> di
     return out
 
 
+class Cancelled(Exception):
+    pass
+
+
+def _atomic_write(path: Path, data: Any) -> None:
+    """Readers (the dashboard) never see a half-written JSON file."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.replace(tmp, path)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m benchmark.suite", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -84,6 +97,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--episodes", type=int, default=20, help="episodes per (controller, level) point")
     ap.add_argument("--seed", type=int, default=0, help="base seed; episode i uses seed+i at every point")
     ap.add_argument("--out", default="runs")
+    ap.add_argument("--run-dir", default=None, help="exact output directory (must not exist or be empty)")
     ap.add_argument("--observations", action="store_true", help="also log full observations per request")
     ap.add_argument("--quiet", action="store_true")
     add_difficulty_args(ap)
@@ -103,13 +117,20 @@ def main(argv: Optional[list[str]] = None) -> int:
         factories[spec] = (name, ns, extra)
         controller_factory(name, ns)  # fail fast (e.g. missing Jev token) before any episode runs
 
-    out_dir = new_run_dir(args.out, "suite", args.param)
+    if args.run_dir:
+        out_dir = Path(args.run_dir)
+        if out_dir.exists() and any(out_dir.iterdir()):
+            ap.error(f"--run-dir {out_dir} is not empty")
+    else:
+        out_dir = new_run_dir(args.out, "suite", args.param)
     out_dir.mkdir(parents=True, exist_ok=True)
+    total_episodes = len(levels) * len(specs) * args.episodes
     manifest: dict[str, Any] = {
         "kind": "suite",
         "version": SUITE_VERSION,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "status": "running",
+        "pid": os.getpid(),
         "param": args.param,
         "levels": levels,
         "controllers": specs,
@@ -120,43 +141,78 @@ def main(argv: Optional[list[str]] = None) -> int:
         "added_latency_ms": args.latency_ms,
         "observations_logged": bool(args.observations),
         "argv": sys.argv[1:] if argv is None else argv,
+        "progress": {"episodes_done": 0, "episodes_total": total_episodes, "points_done": 0,
+                     "points_total": len(levels) * len(specs), "current": None},
+        "updated": time.time(),
     }
+    last_write = [0.0]
 
-    def write_manifest():
-        (out_dir / "suite.json").write_text(json.dumps(manifest, indent=2))
+    def write_manifest(force: bool = True):
+        now = time.time()
+        if force or now - last_write[0] > 0.5:
+            manifest["updated"] = now
+            _atomic_write(out_dir / "suite.json", manifest)
+            last_write[0] = now
 
+    def on_sigterm(signum, frame):
+        raise Cancelled()
+
+    prev_handler = signal.signal(signal.SIGTERM, on_sigterm) if hasattr(signal, "SIGTERM") else None
     write_manifest()
     results: list[dict[str, Any]] = []
     t0 = time.perf_counter()
-    with open(out_dir / "results.jsonl", "w") as rf:
-        for lv in levels:
-            for spec in specs:
-                name, ns, extra = factories[spec]
-                make_config, make_ctrl = _level_setup(ns, base_cfg, args.param)
-                # latency_ms as the swept param adds to the spec's own latency
-                factory = (controller_factory(name, ns, latency_ms=lv + extra) if args.param == "latency_ms"
-                           else make_ctrl(lv))
-                ep_dir = out_dir / "episodes" / spec / level_key(lv)
-                rs = run_episodes(factory, make_config(lv), args.episodes, args.seed,
-                                  events_dir=ep_dir, record_observations=args.observations)
-                for i, r in enumerate(rs):
-                    rec = {k: v for k, v in r.items() if k != "action_changes"}
-                    rec.update({"controller_spec": spec, "level": lv,
-                                "episode_dir": str((ep_dir / f"episode_{i:04d}_seed{r['seed']}").relative_to(out_dir))})
-                    rf.write(json.dumps(rec, separators=(",", ":")) + "\n")
-                    results.append(rec)
-                rf.flush()
-                agg = aggregate(rs)
-                if not args.quiet:
-                    print(f"  {args.param}={lv:g}  {spec:<22} success {agg['success_rate']:.2f}  "
-                          f"targets {agg['mean_targets']:.1f}  survival {agg['mean_survival_time']:.1f}s", flush=True)
-                (out_dir / "summary.json").write_text(json.dumps(build_summary(manifest, results), indent=2))
+    try:
+        with open(out_dir / "results.jsonl", "w") as rf:
+            for lv in levels:
+                for spec in specs:
+                    name, ns, extra = factories[spec]
+                    make_config, make_ctrl = _level_setup(ns, base_cfg, args.param)
+                    # latency_ms as the swept param adds to the spec's own latency
+                    factory = (controller_factory(name, ns, latency_ms=lv + extra) if args.param == "latency_ms"
+                               else make_ctrl(lv))
+                    ep_dir = out_dir / "episodes" / spec / level_key(lv)
+                    manifest["progress"]["current"] = {"controller": spec, "level": lv}
+                    base_done = manifest["progress"]["episodes_done"]
+
+                    def progress(i, r, base_done=base_done):
+                        manifest["progress"]["episodes_done"] = base_done + i + 1
+                        write_manifest(force=False)
+
+                    rs = run_episodes(factory, make_config(lv), args.episodes, args.seed,
+                                      events_dir=ep_dir, record_observations=args.observations, progress=progress)
+                    for i, r in enumerate(rs):
+                        rec = {k: v for k, v in r.items() if k != "action_changes"}
+                        rec.update({"controller_spec": spec, "level": lv,
+                                    "episode_dir": str((ep_dir / f"episode_{i:04d}_seed{r['seed']}").relative_to(out_dir))})
+                        rf.write(json.dumps(rec, separators=(",", ":")) + "\n")
+                        results.append(rec)
+                    rf.flush()
+                    agg = aggregate(rs)
+                    if not args.quiet:
+                        print(f"  {args.param}={lv:g}  {spec:<22} success {agg['success_rate']:.2f}  "
+                              f"targets {agg['mean_targets']:.1f}  survival {agg['mean_survival_time']:.1f}s", flush=True)
+                    _atomic_write(out_dir / "summary.json", build_summary(manifest, results))
+                    manifest["progress"]["points_done"] += 1
+                    write_manifest()
+    except (Cancelled, KeyboardInterrupt):
+        # Keep every completed point; the partial episode in flight is discarded.
+        manifest["status"] = "cancelled"
+        manifest["progress"]["current"] = None
+        manifest["wall_time_s"] = time.perf_counter() - t0
+        _atomic_write(out_dir / "summary.json", build_summary(manifest, results))
+        write_manifest()
+        print(f"\ncancelled; {manifest['progress']['points_done']} complete points kept in {out_dir}", flush=True)
+        return 130
+    finally:
+        if prev_handler is not None:
+            signal.signal(signal.SIGTERM, prev_handler)
 
     manifest["status"] = "complete"
+    manifest["progress"]["current"] = None
     manifest["wall_time_s"] = time.perf_counter() - t0
     write_manifest()
     summary = build_summary(manifest, results)
-    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+    _atomic_write(out_dir / "summary.json", summary)
     print(f"\nsaved to {out_dir}")
     for spec, c in summary["controllers"].items():
         d50 = c["thresholds"]["D50"]

@@ -61,7 +61,8 @@ export interface ControllerAnalysis {
 
 export interface SuiteManifest {
   kind: "suite";
-  status: "running" | "complete";
+  status: "running" | "complete" | "cancelled" | "interrupted";
+  progress?: SuiteProgress;
   created: string;
   param: string;
   levels: number[];
@@ -97,6 +98,7 @@ export interface RunInfo {
   levels?: number[];
   controllers?: string[];
   status?: string;
+  progress?: SuiteProgress;
   episodes_per_point?: number;
   episodes?: number;
   success_rate?: number | null;
@@ -107,7 +109,46 @@ export interface RunInfo {
   seed?: number;
 }
 
+export interface SuiteProgress {
+  episodes_done: number;
+  episodes_total: number;
+  points_done: number;
+  points_total: number;
+  current: { controller: string; level: number } | null;
+}
+
+export type JobStatus = "running" | "cancelling" | "succeeded" | "failed" | "cancelled";
+export interface Job {
+  id: string;
+  status: JobStatus;
+  suite_id: string | null;
+  suite_status: string | null;
+  progress: SuiteProgress | null;
+  command: string;
+  started: number;
+  ended: number | null;
+  elapsed_s: number;
+  returncode: number | null;
+  log_tail: string[];
+}
+
+export interface JobSpec {
+  controllers: string[];
+  param: string;
+  levels: number[];
+  episodes: number;
+  preset: string;
+  seed?: number;
+  obstacles?: number;
+  decision_hz?: number;
+  max_duration?: number;
+  max_inflight?: number;
+  deadline_ms?: number;
+  target_timeout?: number;
+}
+
 export interface Meta {
+  jobs_enabled: boolean;
   runs_root: string;
   presets: Record<string, Record<string, number | null>>;
   controllers: string[];
@@ -171,6 +212,13 @@ async function get<T>(path: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+async function post<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error((data as { error?: string }).error ?? `${res.status}`);
+  return data as T;
+}
+
 const q = encodeURIComponent;
 export const api = {
   meta: () => get<Meta>("/api/meta"),
@@ -189,4 +237,7 @@ export const api = {
       `/api/suites/${q(id)}/compare?level=${level}&seed=${seed}`,
     ),
   replay: (id: string, episode: string) => get<Replay>(`/api/suites/${q(id)}/replay?episode=${q(episode)}`),
+  jobs: () => get<Job[]>("/api/jobs"),
+  startJob: (spec: JobSpec) => post<Job>("/api/jobs", spec),
+  cancelJob: (id: string) => post<Job>(`/api/jobs/${q(id)}/cancel`, {}),
 };

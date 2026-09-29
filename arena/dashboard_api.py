@@ -21,6 +21,11 @@ Endpoints (JSON):
     GET /api/suites/<id>/episodes?controller=<spec>&level=<level>
     GET /api/suites/<id>/compare?level=<level>&seed=<seed>
     GET /api/suites/<id>/replay?episode=<relative episode dir>
+
+Benchmark jobs (only when the server binds to localhost, see arena.dashboard_jobs):
+    GET  /api/jobs            GET /api/jobs/<id>
+    POST /api/jobs            POST /api/jobs/<id>/cancel
+Jobs run the unchanged ``python -m benchmark.suite`` CLI as a subprocess.
 """
 from __future__ import annotations
 
@@ -36,6 +41,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from arena.dashboard_jobs import JobError, JobManager
 from arena.difficulty import PRESETS, DifficultyConfig
 from arena.dotenv import load_dotenv
 from arena.stats import mean, percentile
@@ -64,6 +70,28 @@ def _read_jsonl(path: Path):
 
 
 # =============================================================== run listing
+def _pid_alive(pid: Any) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def effective_status(manifest: dict[str, Any]) -> Optional[str]:
+    """'running' only while the writing process exists; otherwise 'interrupted'."""
+    status = manifest.get("status")
+    if status == "running" and "pid" in manifest and not _pid_alive(manifest["pid"]):
+        return "interrupted"
+    return status
+
+
 def classify_run(d: Path) -> Optional[dict[str, Any]]:
     """Describe one run directory, or None if it is not a recognised artifact."""
     stat = d.stat()
@@ -71,7 +99,8 @@ def classify_run(d: Path) -> Optional[dict[str, Any]]:
     if (d / "suite.json").is_file():
         m = _read_json(d / "suite.json")
         return {**base, "kind": "suite", "title": f"suite · {m['param']}", "param": m["param"],
-                "levels": m["levels"], "controllers": m["controllers"], "status": m.get("status"),
+                "levels": m["levels"], "controllers": m["controllers"], "status": effective_status(m),
+                "progress": m.get("progress"),
                 "episodes_per_point": m.get("episodes_per_point"), "created": m.get("created")}
     if (d / "summary.json").is_file():
         s = _read_json(d / "summary.json")
@@ -120,6 +149,7 @@ def _latency_block(values: list[float], period_ms: float, hi: float) -> dict[str
 
 def analyse_suite(d: Path) -> dict[str, Any]:
     manifest = _read_json(d / "suite.json")
+    manifest["status"] = effective_status(manifest)
     summary = _read_json(d / "summary.json") if (d / "summary.json").is_file() else {"controllers": {}}
     results = list(_read_jsonl(d / "results.jsonl")) if (d / "results.jsonl").is_file() else []
     cfg = manifest["config"]
@@ -260,8 +290,9 @@ def replay_episode(ep_dir: Path, max_frames: int = 2400) -> dict[str, Any]:
 
 # ===================================================================== API
 class DashboardAPI:
-    def __init__(self, runs_root: Path):
+    def __init__(self, runs_root: Path, jobs_enabled: bool = False):
         self.root = Path(runs_root).resolve()
+        self.jobs = JobManager(self.root) if jobs_enabled else None
         self._cache: dict[str, tuple[float, Any]] = {}
         self._lock = threading.Lock()
 
@@ -304,6 +335,7 @@ class DashboardAPI:
             "benchmarkable": [c for c in CONTROLLER_NAMES if c not in ("sleep", "remote", "human")],
             "jev_token": jev,
             "sweepable": list(SWEEPABLE),
+            "jobs_enabled": self.jobs is not None,
         }
 
     def runs(self) -> list[dict[str, Any]]:
@@ -328,7 +360,9 @@ class DashboardAPI:
         d = self._suite_dir(run_id)
         stamp = max((d / f).stat().st_mtime for f in ("suite.json", "results.jsonl", "summary.json")
                     if (d / f).is_file())
-        return self._cached(f"suite:{d.name}", stamp, lambda: analyse_suite(d))
+        m = _read_json(d / "suite.json")
+        key = f"suite:{d.name}:{effective_status(m)}"  # a crash changes the status without touching files
+        return self._cached(key, stamp, lambda: analyse_suite(d))
 
     def episodes(self, run_id: str, controller: Optional[str], level: Optional[str]) -> list[dict[str, Any]]:
         d = self._suite_dir(run_id)
@@ -368,6 +402,12 @@ class DashboardAPI:
             return self.suites()
         if len(parts) == 2 and parts[0] == "suites":
             return self.suite(parts[1])
+        if parts and parts[0] == "jobs":
+            jobs = self._jobs()
+            if len(parts) == 1:
+                return jobs.list()
+            if len(parts) == 2:
+                return jobs.get(parts[1])
         if len(parts) == 3 and parts[0] == "suites":
             sid, what = parts[1], parts[2]
             if what == "episodes":
@@ -382,10 +422,32 @@ class DashboardAPI:
                 return self.replay(sid, q["episode"])
         raise ApiError(404, f"no endpoint {path}")
 
+    def _jobs(self) -> JobManager:
+        if self.jobs is None:
+            raise ApiError(403, "running benchmarks from the dashboard is disabled on this server")
+        return self.jobs
+
+    def route_post(self, path: str, body: Any) -> Any:
+        parts = [p for p in path.split("/") if p][1:]
+        jobs = self._jobs()
+        if parts == ["jobs"]:
+            if not isinstance(body, dict):
+                raise ApiError(400, "expected a JSON object")
+            meta = self.meta()
+            return jobs.start(body, meta["benchmarkable"], meta["jev_token"])
+        if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "cancel":
+            return jobs.cancel(parts[1])
+        raise ApiError(404, f"no endpoint POST {path}")
+
+
+def _loopback(host: str) -> bool:
+    return host in ("127.0.0.1", "localhost", "::1") or host.startswith("127.")
+
 
 def make_server(runs_root: Path, host: str = "127.0.0.1", port: int = 8787,
-                static_dir: Optional[Path] = DIST) -> ThreadingHTTPServer:
-    api = DashboardAPI(runs_root)
+                static_dir: Optional[Path] = DIST, jobs: Optional[bool] = None) -> ThreadingHTTPServer:
+    # Starting processes is only offered on a loopback-bound server unless explicitly enabled.
+    api = DashboardAPI(runs_root, jobs_enabled=_loopback(host) if jobs is None else jobs)
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -404,12 +466,42 @@ def make_server(runs_root: Path, host: str = "127.0.0.1", port: int = 8787,
                 try:
                     data = api.route(u.path, parse_qs(u.query))
                     self._send(200, json.dumps(data, separators=(",", ":")).encode(), "application/json")
-                except ApiError as e:
+                except (ApiError, JobError) as e:
                     self._send(e.status, json.dumps({"error": str(e)}).encode(), "application/json")
                 except Exception as e:  # never crash the server on a bad artifact
                     self._send(500, json.dumps({"error": f"{type(e).__name__}: {e}"}).encode(), "application/json")
                 return
             self._static(u.path)
+
+        def do_POST(self) -> None:
+            u = urlsplit(self.path)
+            try:
+                if not u.path.startswith("/api/"):
+                    raise ApiError(404, "not found")
+                # CSRF guard: JSON bodies force a CORS preflight (which we never grant),
+                # and a present Origin must be this server.
+                ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip()
+                if ctype != "application/json":
+                    raise ApiError(415, "Content-Type must be application/json")
+                origin = self.headers.get("Origin")
+                if origin and urlsplit(origin).netloc != self.headers.get("Host"):
+                    raise ApiError(403, "cross-origin request refused")
+                length = int(self.headers.get("Content-Length") or 0)
+                if length > 64_000:
+                    raise ApiError(413, "request too large")
+                raw = self.rfile.read(length) if length else b"{}"
+                try:
+                    body = json.loads(raw or b"{}")
+                except ValueError:
+                    raise ApiError(400, "invalid JSON")
+                data = api.route_post(u.path, body)
+                self._send(200, json.dumps(data, separators=(",", ":")).encode(), "application/json")
+            except ApiError as e:
+                self._send(e.status, json.dumps({"error": str(e)}).encode(), "application/json")
+            except JobError as e:
+                self._send(e.status, json.dumps({"error": str(e)}).encode(), "application/json")
+            except Exception as e:
+                self._send(500, json.dumps({"error": f"{type(e).__name__}: {e}"}).encode(), "application/json")
 
         def _static(self, path: str) -> None:
             if static_dir is None or not (static_dir / "index.html").is_file():
@@ -429,6 +521,7 @@ def make_server(runs_root: Path, host: str = "127.0.0.1", port: int = 8787,
 
     srv = ThreadingHTTPServer((host, port), Handler)
     srv.daemon_threads = True
+    srv.api = api  # type: ignore[attr-defined]
     return srv
 
 
@@ -437,17 +530,24 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--runs", default="runs")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8787)
+    ap.add_argument("--enable-jobs", action="store_true", help="allow starting benchmarks even on a non-loopback host")
+    ap.add_argument("--disable-jobs", action="store_true", help="read-only: never start benchmarks")
     args = ap.parse_args(argv)
     load_dotenv()
-    srv = make_server(Path(args.runs), args.host, args.port)
+    jobs = False if args.disable_jobs else (True if args.enable_jobs else None)
+    srv = make_server(Path(args.runs), args.host, args.port, jobs=jobs)
     host, port = srv.server_address[:2]
     print(f"Decision Arena dashboard: http://{host}:{port}   (runs: {Path(args.runs).resolve()})")
     if not (DIST / "index.html").is_file():
         print("UI not built yet: cd dashboard && npm install && npm run build   (API works meanwhile)")
+    print("benchmark jobs: " + ("enabled" if srv.api.jobs else "disabled (read-only)"))  # type: ignore[attr-defined]
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        if srv.api.jobs:  # type: ignore[attr-defined]
+            srv.api.jobs.shutdown()  # type: ignore[attr-defined]
     return 0
 
 

@@ -127,8 +127,23 @@ For development, run `npm run dev` in `dashboard/` (port 5173, proxies `/api`).
   and verified against the logged result. No physics runs in JavaScript.
 * **Runs:** everything under `runs/`.
 * **Live Arena:** points to the desktop app (`python main.py`).
-* **Sidebar:** builds the exact `benchmark.suite` command for a new
-  experiment. Suites appear in the selector while they run and update live.
+* **Run benchmark from the UI:**
+  - The sidebar's **Run benchmark** starts exactly the `benchmark.suite`
+    command it displays, as a subprocess with a validated argument list and
+    no shell. It's the same CLI, runner and semantics as a terminal run.
+  - A live strip shows progress (episodes and points), the point being
+    measured, elapsed time and ETA, with the log and a **Cancel** button.
+  - The frontier fills in as each point completes. Cancel keeps all
+    completed points, and the suite is marked `cancelled`.
+  - A suite whose process died is shown as `interrupted`.
+  - Selecting Jev first shows an upper bound on real API requests.
+  - **One benchmark at a time:** parallel suites would compete for CPU and
+    distort wall-clock latency, which the benchmark charges to controllers.
+  - Jobs are enabled only when the server binds to localhost (default). Use
+    `--disable-jobs` for a read-only server, or `--enable-jobs` to allow jobs
+    on another host.
+  - POSTs must be JSON from the same origin (CSRF guard).
+  - "copy as command" is still available for terminal runs.
 
 Integrity:
 * `arena/dashboard_api.py` only reads artifacts and re-simulates for replay.
